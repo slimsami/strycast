@@ -901,6 +901,7 @@ endfunction()
   add_subdirectory(tests/models/qwen)
   add_subdirectory(tests/models/qwen27b)
   gufo_loom_register_tests()
+  add_subdirectory(tests/models/qwen35ba3b)
   gufo_qwen3_asr_register_tests()
   gufo_qwen_image_21_register_tests()
 
