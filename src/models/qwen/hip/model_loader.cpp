@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/platform/pages.hpp"
@@ -16,8 +17,6 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
-
-#include "qfn_mmq.h"
 
 namespace gufo::hip {
 namespace {
@@ -381,12 +380,12 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
                remap(layer.ssm_conv1d) && remap(layer.ssm_alpha) &&
                remap(layer.ssm_beta) && remap(layer.ssm_a) &&
                remap(layer.ssm_dt) && remap(layer.ssm_norm) &&
-                remap(layer.ffn_norm) && remap(layer.ffn_gate) &&
-                remap(layer.ffn_up) && remap(layer.ffn_down) &&
-                remap(layer.ffn_gate_inp) && remap(layer.ffn_gate_inp_shexp) &&
-                remap(layer.ffn_gate_exps) && remap(layer.ffn_up_exps) &&
-                remap(layer.ffn_down_exps) && remap(layer.ffn_gate_shexp) &&
-                remap(layer.ffn_up_shexp) && remap(layer.ffn_down_shexp);
+               remap(layer.ffn_norm) && remap(layer.ffn_gate) &&
+               remap(layer.ffn_up) && remap(layer.ffn_down) &&
+               remap(layer.ffn_gate_inp) && remap(layer.ffn_gate_inp_shexp) &&
+               remap(layer.ffn_gate_exps) && remap(layer.ffn_up_exps) &&
+               remap(layer.ffn_down_exps) && remap(layer.ffn_gate_shexp) &&
+               remap(layer.ffn_up_shexp) && remap(layer.ffn_down_shexp);
   }
   if (!remapped) {
     ReleaseWeightRegions(weight_regions);

@@ -492,8 +492,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       auto launch_pair = [&] {
         if (!q::RoutedGatedF16Gemm(
                 d_w, d_up, type, d_x_half, d_gate_tiles,
-                static_cast<std::uint32_t>(gate_tiles.size()), d_bounds,
-                d_rows_token, d_rows_slot, d_pair, m, k, nullptr)) {
+                static_cast<std::uint32_t>(gate_tiles.size()), pair_rows,
+                d_bounds, d_rows_token, d_rows_slot, d_pair, m, k, nullptr)) {
           throw std::runtime_error("paired routed SwiGLU launch failed");
         }
       };
@@ -1033,7 +1033,7 @@ std::vector<__half> PairedSwiglu(const Routing& r, const void* gate,
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(128, &n);
   auto* out = Upload(std::vector<__half>(r.slots * m, __float2half(-7.0F)));
-  if (!q::RoutedGatedF16Gemm(gate, up, type, x, tiles, n, r.d_bounds,
+  if (!q::RoutedGatedF16Gemm(gate, up, type, x, tiles, n, 128, r.d_bounds,
                              r.d_rows_token, r.d_rows_slot, out, m, k, nullptr))
     throw std::runtime_error("paired routed launch rejected");
   CheckHip(hipDeviceSynchronize(), "paired routed launch");
