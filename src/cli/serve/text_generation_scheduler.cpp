@@ -2013,6 +2013,19 @@ struct TextGenerationScheduler::Impl {
       }
 
       progress.fetch_add(1, std::memory_order_relaxed);
+      // After a bounded prompt chunk the decoders are owed the remaining
+      // rounds of the policy before the next chunk.
+      if (decode_rounds_owed != 0 &&
+          std::none_of(
+              decoding.begin(), decoding.end(),
+              [](const auto& request) { return request->decode_due; })) {
+        if (prefilling.empty() || decoding.empty()) {
+          decode_rounds_owed = 0;
+        } else {
+          --decode_rounds_owed;
+          MarkAllDecodersDue(decoding);
+        }
+      }
       const std::size_t resident_count = prefilling.size() + decoding.size();
       const bool preparing_multi_token_batch =
           multi_token_decode && resident_count > 1 && !prefilling.empty() &&
@@ -2081,8 +2094,10 @@ struct TextGenerationScheduler::Impl {
           prefilling.push_back(std::move(request));
         }
       }
-      if (prefill.beside_decoders)
+      if (prefill.beside_decoders) {
         MarkAllDecodersDue(decoding);
+        decode_rounds_owed = prefill_policy.decode_rounds_per_chunk - 1;
+      }
     }
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
@@ -2117,6 +2132,7 @@ struct TextGenerationScheduler::Impl {
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
   std::uint64_t last_prefill_request_id{0};
+  std::size_t decode_rounds_owed{0};
   std::atomic<std::uint64_t> next_request_id{1};
   // Written by the scheduler thread and read by the stall monitor. `progress`
   // advances when a request is admitted, a work unit starts, a pending
