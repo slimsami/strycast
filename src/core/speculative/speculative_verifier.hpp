@@ -26,6 +26,10 @@ struct SpeculativeOptions {
   bool enable_adaptive_draft_length{true};
   bool use_batched_verification{false};
   bool retain_frontier_logits{false};
+  /// MTP prompt-prime slice width: rows per batched prime. `0` selects the
+  /// legacy per-token serial prime. Reachable from `serve llm
+  /// --mtp-prime-chunk`; the other draft backends ignore it.
+  std::uint32_t mtp_prime_chunk{1024};
 };
 
 /// Generation contract for speculative decoding: a token budget plus the

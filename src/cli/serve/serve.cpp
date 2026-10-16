@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-#include "gufo/ext/registry.hpp"
+#include <gufo/ext/registry.hpp>
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
@@ -666,6 +666,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
+    std::size_t mtp_prime_chunk = 1024;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t prefill_decode_rounds = 1;
@@ -763,6 +764,11 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
                      &min_draft_tokens);
+    parser.AddOption(
+        "", "--mtp-prime-chunk", "N",
+        "Rows per batched MTP prompt-prime slice; 0 restores the legacy "
+        "per-token prime (default: 1024)",
+        "Speculative", &mtp_prime_chunk);
     parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -1334,6 +1340,7 @@ int RunServe(std::span<const char* const> args) {
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
+    std::size_t mtp_prime_chunk = 1024;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t prefill_decode_rounds = 1;
@@ -1438,6 +1445,11 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
                          &min_draft_tokens);
+    llm_parser.AddOption(
+        "", "--mtp-prime-chunk", "N",
+        "Rows per batched MTP prompt-prime slice; 0 restores the legacy "
+        "per-token prime (default: 1024)",
+        "Speculative", &mtp_prime_chunk);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -1557,7 +1569,8 @@ int RunServe(std::span<const char* const> args) {
     }
     if (draft_tokens == 0 || min_draft_tokens == 0 ||
         min_draft_tokens > draft_tokens ||
-        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        draft_tokens > std::numeric_limits<std::uint32_t>::max() ||
+        mtp_prime_chunk > std::numeric_limits<std::uint32_t>::max()) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
@@ -1618,6 +1631,8 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
+    speculative_config.mtp_prime_chunk =
+        static_cast<std::uint32_t>(mtp_prime_chunk);
     if (model.empty()) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
