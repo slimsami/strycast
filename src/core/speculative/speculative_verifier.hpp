@@ -357,12 +357,15 @@ public:
                         tokenization::TokenId eos_id,
                         std::uint32_t max_emitted_tokens, float temperature,
                         std::uint64_t* rng_state);
+  /// `max_draft_tokens` bounds the draft like StepRequest::max_draft_tokens.
   StepResult VerifyStep(std::span<const tokenization::TokenId> current_sequence,
                         std::uint32_t cur_pos,
                         tokenization::TokenId current_token,
                         tokenization::TokenId eos_id,
                         std::uint32_t max_emitted_tokens,
-                        sampling::SamplerState& sampler);
+                        sampling::SamplerState& sampler,
+                        std::uint32_t max_draft_tokens =
+                            std::numeric_limits<std::uint32_t>::max());
 
   [[nodiscard]] std::unique_ptr<SpeculativeVerifierSnapshot> Snapshot() const;
   void RestoreSnapshot(const SpeculativeVerifierSnapshot& snapshot);

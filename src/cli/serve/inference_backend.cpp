@@ -84,7 +84,8 @@ void SetError(std::string* error, std::string message) {
 /// token at two sessions and stops drafting at three: on the 35B, two greedy
 /// sessions gave 86.9 total tok/s with one MTP draft token against 85.6 with
 /// two, and one token gave 99.4/107.2 at three/four sessions against
-/// 99.1/111.0 with none.
+/// 99.1/111.0 with none. Seeded sampled requests take the ceiling for the
+/// configured sessions instead, see QwenTextRunner::DraftCap.
 std::uint32_t ConcurrentDraftCap(std::size_t active, bool moe_target,
                                  bool mtp_draft) {
   if (active <= 1 || !moe_target)
@@ -791,7 +792,8 @@ public:
   }
 
   [[nodiscard]] TextDecodeStep DecodeSpeculative(
-      std::size_t max_tokens, sampling::SamplerState& sampler) {
+      std::size_t max_tokens, sampling::SamplerState& sampler,
+      std::uint32_t max_draft_tokens) {
     TextDecodeStep result;
     sampling::SamplerState working_sampler = sampler;
     if (PrepareSpeculativeDecode(max_tokens, working_sampler, result)) {
@@ -799,7 +801,7 @@ public:
           max_tokens - result.selections.size(), working_sampler);
       auto verification = verifier_->VerifyStep(
           sequence_, request.position, request.current_token, request.eos_id,
-          request.max_emitted_tokens, working_sampler);
+          request.max_emitted_tokens, working_sampler, max_draft_tokens);
       FinishSpeculativeDecode(std::move(verification), working_sampler, result);
     }
     sampler.SetRngState(working_sampler.rng_state());
@@ -1157,12 +1159,14 @@ public:
       std::shared_ptr<const hip::QwenMtpGpuModel> mtp_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
-      std::string draft_artifact_fingerprint = {})
+      std::string draft_artifact_fingerprint = {},
+      std::size_t session_count = 1)
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         mtp_model_(std::move(mtp_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
+        session_count_(session_count),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -1541,7 +1545,7 @@ public:
     if (!qwen.speculative()) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
-    return qwen.DecodeSpeculative(max_tokens, sampler);
+    return qwen.DecodeSpeculative(max_tokens, sampler, DraftCap(sampler, 1));
   }
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
@@ -1571,11 +1575,8 @@ public:
         indices.push_back(index);
       }
     }
-    const auto draft_cap =
-        ConcurrentDraftCap(requests.size(), model_->GetConfig().IsMoE(),
-                           DraftKind() == QwenDraftKind::kMtp);
     for (auto& request : requests)
-      request.max_draft_tokens = draft_cap;
+      request.max_draft_tokens = DraftCap(request.sampler, requests.size());
     auto verified = speculative::SpeculativeVerifier::VerifyBatch(requests);
     for (std::size_t item = 0; item < indices.size(); ++item) {
       const std::size_t index = indices[item];
@@ -1635,6 +1636,20 @@ public:
   }
 
 private:
+  /// Draft ceiling for one request while `active` requests decode. As in
+  /// Flash-Next (#703), greedy and unseeded sampled requests follow the
+  /// requests decoding now. A seeded sampled request takes the ceiling for the
+  /// configured sessions: its drafts consume its RNG, so it must draft the same
+  /// at any load to replay the same text.
+  [[nodiscard]] std::uint32_t DraftCap(const sampling::SamplerState& sampler,
+                                       std::size_t active) const {
+    const bool seeded =
+        sampler.config().uses_random_sampling() && sampler.config().seed >= 0;
+    return ConcurrentDraftCap(seeded ? session_count_ : active,
+                              model_->GetConfig().IsMoE(),
+                              DraftKind() == QwenDraftKind::kMtp);
+  }
+
   [[nodiscard]] QwenDraftKind DraftKind() const noexcept {
     if (dflash_model_ != nullptr) {
       return QwenDraftKind::kDFlash;
@@ -1654,6 +1669,7 @@ private:
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_model_;
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
+  std::size_t session_count_;
   hip::QwenExecutionPolicy execution_policy_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
@@ -3635,7 +3651,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         std::move(model), max_context, std::move(dflash_model),
         std::move(mtp_model), speculative_options,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint, session_count);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
