@@ -297,6 +297,10 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
 /// Whether RoutedGatedF16Gemm decodes `type`.
 bool RoutedGatedF16Supported(WeightType type);
 
+/// Whether RoutedF16Gemm takes `type` with 64- and 128-row tiles; Q4_K and
+/// Q5_K stop at 48.
+bool RoutedF16WideTilesSupported(WeightType type);
+
 /// Paired Q4_K/Q5_K/Q6_K/Q8_0 gate/up GEMM with SwiGLU and F16 output. Uses
 /// the same routing layout as RoutedF16Gemm, with 64 or 128 token rows per
 /// tile. The two projections share one launch and never materialize the gate

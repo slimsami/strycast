@@ -6707,6 +6707,11 @@ bool RoutedGatedF16Supported(WeightType type) {
          type == WeightType::kQ6_K || type == WeightType::kQ8_0;
 }
 
+bool RoutedF16WideTilesSupported(WeightType type) {
+  return type == WeightType::kQ5_1 || type == WeightType::kQ6_K ||
+         type == WeightType::kQ8_0;
+}
+
 bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const __half* x, const std::int32_t* tiles,
                         std::uint32_t n_tiles, std::uint32_t tile_rows,
