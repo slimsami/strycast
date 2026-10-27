@@ -149,8 +149,7 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
       const std::size_t rows = std::min(kGatedVecMaxRows, batch_size - row);
       if (qfn_mmq_moe_gated_vec(
               static_cast<int>(view.gate_exps.type), view.gate_exps.data,
-              view.up_exps.data,
-              scratch.decode.normed.data() + row * hidden,
+              view.up_exps.data, scratch.decode.normed.data() + row * hidden,
               moe.ids.data() + row * n_used,
               moe.gate_e.data() + row * n_used * expert_ff,
               static_cast<int>(expert_ff), static_cast<int>(hidden),
@@ -167,11 +166,11 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
   }
   if (IsMoeMmqVecType(view.down_exps.type)) {
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
-                        view.down_exps.data, moe.gate_e.data(),
-                        moe.ids.data(), moe.down_e.data(),
-                        static_cast<int>(hidden), static_cast<int>(expert_ff),
-                        static_cast<int>(slots), static_cast<int>(n_experts), 1,
-                        stream, nullptr, nullptr) != 0) {
+                        view.down_exps.data, moe.gate_e.data(), moe.ids.data(),
+                        moe.down_e.data(), static_cast<int>(hidden),
+                        static_cast<int>(expert_ff), static_cast<int>(slots),
+                        static_cast<int>(n_experts), 1, stream, nullptr,
+                        nullptr) != 0) {
       throw std::runtime_error("MoE down expert projection failed");
     }
   } else {

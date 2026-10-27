@@ -50,10 +50,10 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
   if (mmq_gated) {
     if (qfn_mmq_moe_gated_vec(
             static_cast<int>(view.gate_exps.type), view.gate_exps.data,
-            view.up_exps.data, x,
-            moe.ids.data(), moe.gate_e.data(), static_cast<int>(expert_ff),
-            static_cast<int>(hidden), 1, static_cast<int>(n_experts),
-            static_cast<int>(n_used), stream) != 0) {
+            view.up_exps.data, x, moe.ids.data(), moe.gate_e.data(),
+            static_cast<int>(expert_ff), static_cast<int>(hidden), 1,
+            static_cast<int>(n_experts), static_cast<int>(n_used),
+            stream) != 0) {
       throw std::runtime_error("MoE gated expert projection failed");
     }
   } else {
@@ -66,11 +66,11 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
     // Each (token, slot) pair carries its own activation row, so the down
     // projection runs as U independent rows with one expert id each.
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
-                        view.down_exps.data, moe.gate_e.data(),
-                        moe.ids.data(), moe.down_e.data(),
-                        static_cast<int>(hidden), static_cast<int>(expert_ff),
-                        static_cast<int>(n_used), static_cast<int>(n_experts),
-                        1, stream, nullptr, nullptr) != 0) {
+                        view.down_exps.data, moe.gate_e.data(), moe.ids.data(),
+                        moe.down_e.data(), static_cast<int>(hidden),
+                        static_cast<int>(expert_ff), static_cast<int>(n_used),
+                        static_cast<int>(n_experts), 1, stream, nullptr,
+                        nullptr) != 0) {
       throw std::runtime_error("MoE down expert projection failed");
     }
   } else {

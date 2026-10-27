@@ -29,7 +29,8 @@ void LaunchMoeEpilogue(const float* expert_out, const float* weights,
 
 /// Expert formats the MMQ gated vector kernel (qfn_mmq_moe_gated_vec) covers
 /// for decode-sized row counts.
-[[nodiscard]] constexpr bool IsMoeMmqGatedVecType(core::GgmlType type) noexcept {
+[[nodiscard]] constexpr bool IsMoeMmqGatedVecType(
+    core::GgmlType type) noexcept {
   return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
          type == core::GgmlType::kQ8_0;
 }
