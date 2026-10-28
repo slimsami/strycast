@@ -21,7 +21,7 @@ namespace gufo::hip {
 void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                           const models::QwenLayerWeights& layer,
                           const core::ModelConfig& config, const float* x,
-                          float* out) {
+                          float* out, bool combine) {
   const auto view = models::qwen::MakeMoeView(layer, config);
   const std::size_t hidden = config.hidden_size;
   const std::uint32_t n_experts = config.expert_count;
@@ -29,12 +29,23 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
   const std::size_t expert_ff = config.expert_ff_length;
   const std::size_t shared_ff = config.expert_shared_ff_length;
 
-  LaunchGEMV(view.router.data, view.router.type, x, moe.router_logits.data(),
-             n_experts, hidden, stream);
-  LaunchGEMV(view.shexp_gate_inp.data, view.shexp_gate_inp.type, x,
-             moe.shexp_gate.data(), 1, hidden, stream);
-  LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
-                      moe.weights.data(), 1, n_experts, n_used, stream);
+  if (!moe.router_done.empty() &&
+      IsMoeRouterGateTopKSupported(view.router.type, view.shexp_gate_inp.type,
+                                   n_experts, hidden, n_used)) {
+    // Router, shared-expert gate and top-k in one launch, same arithmetic.
+    LaunchMoeRouterGateTopK(view.router.data, view.router.type,
+                            view.shexp_gate_inp.data, view.shexp_gate_inp.type,
+                            x, moe.router_logits.data(), moe.shexp_gate.data(),
+                            moe.ids.data(), moe.weights.data(), n_experts,
+                            hidden, n_used, moe.router_done.data(), stream);
+  } else {
+    LaunchGEMV(view.router.data, view.router.type, x, moe.router_logits.data(),
+               n_experts, hidden, stream);
+    LaunchGEMV(view.shexp_gate_inp.data, view.shexp_gate_inp.type, x,
+               moe.shexp_gate.data(), 1, hidden, stream);
+    LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
+                        moe.weights.data(), 1, n_experts, n_used, stream);
+  }
 
   // Shared expert: plain dense SwiGLU FFN of width shared_ff.
   LaunchFusedSwiGLUGEMV(view.shexp_gate.data, view.shexp_gate.type,
@@ -78,8 +89,11 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                       moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
                       hidden, expert_ff, n_used, 1, stream);
   }
-  LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(), moe.shexp_out.data(),
-                    moe.shexp_gate.data(), out, 1, n_used, hidden, stream);
+  if (combine) {
+    LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(),
+                      moe.shexp_out.data(), moe.shexp_gate.data(), out, 1,
+                      n_used, hidden, stream);
+  }
 }
 
 void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
@@ -307,11 +321,21 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
     }
 
+    // Residual Add, with the next RMSNorm when fused: the next layer's
+    // attention norm, or the output norm after the last layer.
+    const bool last_layer = l + 1 == config.num_layers;
+    const void* next_norm = !last_layer ? weights.layers[l + 1].attn_norm.data
+                            : compute_logits ? weights.output_norm.data
+                                             : nullptr;
+    // The MoE combine then joins that residual add as well.
+    const bool fuse_moe_combine =
+        fuse_residual_norm && next_norm != nullptr && config.IsMoE();
+
     // Fused SwiGLU FFN (dense) or routed MoE FFN
     if (config.IsMoE()) {
       ExecuteMoeDecodeStep(arena.stream, scratch.moe, layer, config,
-                           decode_scratch.normed.data(),
-                           ffn_scratch.out.data());
+                           decode_scratch.normed.data(), ffn_scratch.out.data(),
+                           !fuse_moe_combine);
     } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The
@@ -323,13 +347,14 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           ffn_scratch.activation, ffn_scratch.activation, ffn_scratch.out);
     }
 
-    // Residual Add, with the next RMSNorm when fused: the next layer's
-    // attention norm, or the output norm after the last layer.
-    const bool last_layer = l + 1 == config.num_layers;
-    const void* next_norm = !last_layer ? weights.layers[l + 1].attn_norm.data
-                            : compute_logits ? weights.output_norm.data
-                                             : nullptr;
-    if (fuse_residual_norm && next_norm != nullptr) {
+    if (fuse_moe_combine) {
+      const auto& moe = scratch.moe;
+      LaunchFusedMoeResidualRMSNorm(
+          decode_scratch.hidden.data(), moe.down_e.data(), moe.weights.data(),
+          moe.shexp_out.data(), moe.shexp_gate.data(), config.expert_used_count,
+          static_cast<const float*>(next_norm), decode_scratch.hidden.data(),
+          decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream);
+    } else if (fuse_residual_norm && next_norm != nullptr) {
       LaunchFusedResidualRMSNorm(
           decode_scratch.hidden.data(), ffn_scratch.out.data(),
           static_cast<const float*>(next_norm), decode_scratch.hidden.data(),
