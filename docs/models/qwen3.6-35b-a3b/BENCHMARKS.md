@@ -448,3 +448,62 @@ allocates its KV cache up front, so its peak does not grow with the prefix.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory-q4km.svg)
+
+---
+
+## A second machine: ASUS ProArt PX13 laptop
+
+These rows are not produced by the harness above and are deliberately left
+outside the marked blocks: they come from a different box and a different
+serving path, so the rendered tables keep their bond to the artifacts.
+
+AMD Strix Halo again, in a laptop: an ASUS ProArt PX13 (HN7306EAC), Ryzen AI
+Max+ 395 with the Radeon 8060S (`gfx1151`), 121 GiB of unified memory, running
+the `performance` power profile. Same GPU family as the desktop above, a
+laptop power envelope.
+
+The build is gufo `5faa653b`, the head of
+[#299](https://github.com/gufo-org/gufo/pull/299) — the branch that adds
+`qwen35moe` — compiled in place against this box's ROCm 7.2.4 userland rather
+than the pinned 7.2.3, so these numbers are not toolchain-matched to the tables
+above. It also predates `03d06ea`, the MMQ K-quant expert decode change. The
+target is a derivative whose routed experts are Q6_K and Q8_0, so how far that
+change moves this file depends on which projection carries which format.
+
+Requests went through an OpenAI-compatible router (llama-swap) with a single
+slot serving the model at `--sessions 1`, and the numbers below are the
+server's per-request counters (`prefill_tps`, `decode_tps`, `ttft_ms`) rather
+than `tools/bench/model-bench.py` output. Greedy, one request in flight, two
+reps per cell, spread is the difference between them. Prefill is cold by
+construction — a fresh prompt body per probe and `cache_prompt: false` — so
+there is no warm-cache row here. *Requested* is the prompt size asked for,
+*counted* is what the server tokenized; the probe overshoots by a few per cent,
+so the measured column is the one to quote.
+
+Prefill, cold:
+
+| Requested tokens | Counted tokens | Gufo pp (tok/s) | Spread | TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 639 | 1431.5 | 45.2 | 452 |
+| 2,048 | 2,292 | 1983.2 | 1.2 | 1,159 |
+| 8,192 | 8,928 | 2240.2 | 1.5 | 3,990 |
+| 32,768 | 35,389 | 1939.8 | 5.3 | 18,251 |
+
+Decode, DFlash2 draft on (aminya's Q8_0 conversion, not byte-identical to the
+draft used here — see [the derivative note](README.md#tested-derivatives)):
+
+| Depth (tokens) | Counted tokens | Gufo tg (tok/s) | Spread | Draft accept (%) | TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 78 | 88.2 | 12.4 | 81 | 224 |
+| 4,096 | 4,504 | 52.5 | 1.6 | 49 | 2,110 |
+| 32,768 | 35,389 | 50.5 | 6.3 | 56 | 18,330 |
+
+Two caveats before these are read against the tables above. The decode column
+is the drafted rate: a plain-decoding arm at the same depths is still to come,
+and this machine's draft acceptance at depth (49–56%) sits below what the
+desktop records on mixed prompts, so the laptop's drafted gain over plain
+should be the smaller of the two. And the run's environment record logged the
+source tree as `main` for the two 32K cells, because a branch restore had
+already happened while the binary swap failed on a busy executable; all seven
+cells were produced by the same `5faa653b` binary, which is the only one of the
+two that loads this file at all.
