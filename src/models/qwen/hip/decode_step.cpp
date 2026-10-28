@@ -142,6 +142,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     image_input->Inject(decode_scratch.hidden.data(), pos, 1, hidden_size, 1,
                         arena.stream);
 
+  // Each residual add joins the RMSNorm that reads its sum, so the hidden row
+  // crosses one kernel instead of two; the arithmetic is unchanged.
+  const bool fuse_residual_norm =
+      IsFusedResidualRMSNormQuantizeQ8_1Supported(hidden_size);
+
   // 2. Layer stack
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     const auto& layer = weights.layers[l];
@@ -150,10 +155,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const gufo::models::qwen::HipModuleContext module_ctx(
         static_cast<void*>(arena.stream), l, pos);
 
-    {
+    if (!fuse_residual_norm || l == 0) {
       // Pre-RMSNorm, routed through the norm module (HIP backend). Same
       // kernel, same args, same arena slices (d_hidden in, d_normed out);
       // behavior identical to the former inline `LaunchRMSNorm` call.
+      // Later layers get it from the previous layer's fused residual add.
       const auto norm_view =
           gufo::models::qwen::MakeAttnNormView(layer, config);
       gufo::models::qwen::NormForward(
@@ -282,7 +288,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                  arena.stream);
     }
 
-    {
+    if (fuse_residual_norm) {
+      LaunchFusedResidualRMSNorm(
+          decode_scratch.hidden.data(), attention_scratch.output.data(),
+          static_cast<const float*>(layer.ffn_norm.data),
+          decode_scratch.hidden.data(), decode_scratch.normed.data(),
+          hidden_size, 1e-6F, arena.stream);
+    } else {
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
 
@@ -311,9 +323,21 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           ffn_scratch.activation, ffn_scratch.activation, ffn_scratch.out);
     }
 
-    // Residual Add
-    gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
-                                    ffn_scratch.out);
+    // Residual Add, with the next RMSNorm when fused: the next layer's
+    // attention norm, or the output norm after the last layer.
+    const bool last_layer = l + 1 == config.num_layers;
+    const void* next_norm = !last_layer ? weights.layers[l + 1].attn_norm.data
+                            : compute_logits ? weights.output_norm.data
+                                             : nullptr;
+    if (fuse_residual_norm && next_norm != nullptr) {
+      LaunchFusedResidualRMSNorm(
+          decode_scratch.hidden.data(), ffn_scratch.out.data(),
+          static_cast<const float*>(next_norm), decode_scratch.hidden.data(),
+          decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream);
+    } else {
+      gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
+                                      ffn_scratch.out);
+    }
 
     if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
         tap_index.has_value()) {
@@ -325,11 +349,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   }
 
   if (compute_logits) {
-    // 3. Final Output Norm
-    LaunchRMSNorm(decode_scratch.hidden.data(),
-                  static_cast<const float*>(weights.output_norm.data),
-                  decode_scratch.normed.data(), hidden_size, 1e-6F,
-                  arena.stream);
+    // 3. Final Output Norm (already applied by the last fused residual add)
+    if (!fuse_residual_norm) {
+      LaunchRMSNorm(decode_scratch.hidden.data(),
+                    static_cast<const float*>(weights.output_norm.data),
+                    decode_scratch.normed.data(), hidden_size, 1e-6F,
+                    arena.stream);
+    }
 
     // 4. LM Head Logits GEMV on final token
     LaunchGEMV(weights.output.data, weights.output.type,

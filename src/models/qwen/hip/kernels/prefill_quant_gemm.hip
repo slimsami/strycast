@@ -1184,6 +1184,17 @@ void LaunchBatchedFusedResidualRMSNormQuantizeQ8_1(
   LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, dim, stream);
 }
 
+void LaunchFusedResidualRMSNorm(const float* x, const float* residual,
+                                const float* weight, float* sum_out, float* out,
+                                std::size_t dim, float eps,
+                                hipStream_t stream) {
+  if (!IsFusedResidualRMSNormQuantizeQ8_1Supported(dim)) {
+    return;
+  }
+  BatchedFusedResidualRMSNormQuantizeQ8_1Kernel<8><<<1, 256, 0, stream>>>(
+      x, residual, weight, sum_out, out, nullptr, nullptr, 1, eps, nullptr);
+}
+
 bool IsFusedRMSNormQuantizeQ8_1Supported(std::size_t dim) noexcept {
   // The normed row is staged in LDS, so the row has to fit the 32 KiB a block
   // can hold alongside the reduction scratch, and the quantizer needs whole
