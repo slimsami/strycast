@@ -462,7 +462,7 @@ Max+ 395 with the Radeon 8060S (`gfx1151`), 121 GiB of unified memory, running
 the `performance` power profile. Same GPU family as the desktop above, a
 laptop power envelope.
 
-The build is gufo `5faa653b`, the head of
+The drafted rows are gufo `5faa653b`, the head of
 [#299](https://github.com/gufo-org/gufo/pull/299) — the branch that adds
 `qwen35moe` — compiled in place against this box's ROCm 7.2.4 userland rather
 than the pinned 7.2.3, so these numbers are not toolchain-matched to the tables
@@ -498,12 +498,53 @@ draft used here — see [the derivative note](README.md#tested-derivatives)):
 | 4,096 | 4,504 | 52.5 | 1.6 | 49 | 2,110 |
 | 32,768 | 35,389 | 50.5 | 6.3 | 56 | 18,330 |
 
-Two caveats before these are read against the tables above. The decode column
-is the drafted rate: a plain-decoding arm at the same depths is still to come,
-and this machine's draft acceptance at depth (49–56%) sits below what the
-desktop records on mixed prompts, so the laptop's drafted gain over plain
-should be the smaller of the two. And the run's environment record logged the
-source tree as `main` for the two 32K cells, because a branch restore had
-already happened while the binary swap failed on a busy executable; all seven
-cells were produced by the same `5faa653b` binary, which is the only one of the
-two that loads this file at all.
+Plain, same file and same box, on the current `staging` build (`03d06ea` — the
+MMQ K-quant expert decode change, which is the change that touches this file's
+Q6_K experts), served by the engine directly rather than through the router:
+
+| Requested tokens | Counted tokens | Gufo pp (tok/s) | Spread | TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 639 | 1521.2 | 56.7 | 423 |
+| 2,048 | 2,292 | 2071.2 | 5.7 | 1,109 |
+| 8,192 | 8,928 | 2287.6 | 18.5 | 3,907 |
+| 32,768 | 35,389 | 1982.7 | 7.6 | 17,854 |
+
+| Depth (tokens) | Counted tokens | Gufo tg (tok/s) | Spread | TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 78 | 43.6 | 0.2 | 211 |
+| 4,096 | 4,504 | 43.4 | 0.2 | 2,059 |
+| 32,768 | 35,389 | 39.8 | 0.4 | 17,886 |
+
+Both decode arms generate 128 tokens per probe, so the two decode tables differ
+only in the draft. Plain decode barely moves with context on this box — 43.6
+from an empty prompt against 39.8 at 32K, 9% across the whole range — so the
+drafted fall from 88.2 to 50.5 is draft acceptance dropping (81% to 56%) rather
+than the base rate collapsing underneath it. DFlash2 is worth 2.02x at empty
+context here, 1.21x at 4K and 1.27x at 32K. Those three ratios cross a build
+(`5faa653b` drafted against `03d06ea` plain) and a serving path, so treat them
+as an upper bound on the draft's own contribution until both arms run on one
+binary.
+
+Prefill moved the other way between the same two runs: +6.3% at 512, +4.4% at
+2,048, +2.1% at 8,192, +2.2% at 32,768 — the same sign in all four cells, which
+is the shape the MMQ expert path predicts and not one noise usually keeps to
+itself. It is still not an isolated A/B: build, toolchain patch level and
+serving path all differ between the two tables.
+
+Against the desktop tables — same GPU family at 128 GB, pinned toolchain,
+UD-Q6_K_XL — the laptop keeps 79% of the desktop's plain decode at empty
+context (43.6 against 55.05), 81% at 4K (43.4 against 53.78) and 84% at 32K
+(39.8 against 47.41). Cold prefill falls further behind: 2071.2 against
+3089.57, two thirds of the desktop, which is where a laptop power envelope
+shows up first. The targets are not the same file either, so read these as
+Strix Halo in a laptop rather than as a desktop-to-laptop ratio.
+
+One caveat on the drafted rows above. That run's environment record logged the
+source tree as `main` for the two 32K cells: a branch restore had already moved
+the checkout, and the invocation recorded the tree rather than the executable.
+All seven drafted cells come from one `5faa653b` build — the restore's binary
+copy landed at 21:47:03.269, 94 ms after the run wrote its table, and the
+`main` build that replaced it refuses this file outright with
+`Missing required Qwen tensor: blk.0.ffn_gate.weight`. The plain run has no
+such ambiguity: it recorded the executable it served, and that checkout's code
+is `03d06ea` with documentation-only changes on top.
