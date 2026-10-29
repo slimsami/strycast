@@ -453,54 +453,22 @@ allocates its KV cache up front, so its peak does not grow with the prefix.
 
 ## A second machine: ASUS ProArt PX13 laptop
 
-These rows are not produced by the harness above and are deliberately left
-outside the marked blocks: they come from a different box and a different
-serving path, so the rendered tables keep their bond to the artifacts.
+Contributed by [@Farenheith](https://github.com/Farenheith) on another
+Strix Halo machine, a laptop: an ASUS ProArt PX13 (HN7306EAC), Ryzen AI Max+
+395 with the Radeon 8060S (`gfx1151`), 121 GiB of unified memory, running the
+`performance` power profile. These rows did not come from
+`tools/bench/model-bench.py`, so they sit outside the rendered tables.
 
-AMD Strix Halo again, in a laptop: an ASUS ProArt PX13 (HN7306EAC), Ryzen AI
-Max+ 395 with the Radeon 8060S (`gfx1151`), 121 GiB of unified memory, running
-the `performance` power profile. Same GPU family as the desktop above, a
-laptop power envelope.
+The target is Occamy 1.0 Q6_K, a fine-tune of this model (see
+[Tested derivatives](README.md#tested-derivatives)). The build is Strycast
+`03d06ea`, before the rebase onto Gufo v0.26.0, compiled against the laptop's
+ROCm 7.2.4. `gufo serve` was queried directly with one request in flight,
+greedy, two runs per cell; the spread is the difference between them, and the
+rates are the server's own per-request counters (`prefill_tps`, `decode_tps`,
+`ttft_ms`). *Requested* is the prompt size asked for, *counted* is what the
+server tokenized.
 
-The drafted rows are gufo `5faa653b`, the head of
-[#299](https://github.com/gufo-org/gufo/pull/299) — the branch that adds
-`qwen35moe` — compiled in place against this box's ROCm 7.2.4 userland rather
-than the pinned 7.2.3, so these numbers are not toolchain-matched to the tables
-above. It also predates `03d06ea`, the MMQ K-quant expert decode change. The
-target is a derivative whose routed experts are Q6_K and Q8_0, so how far that
-change moves this file depends on which projection carries which format.
-
-Requests went through an OpenAI-compatible router (llama-swap) with a single
-slot serving the model at `--sessions 1`, and the numbers below are the
-server's per-request counters (`prefill_tps`, `decode_tps`, `ttft_ms`) rather
-than `tools/bench/model-bench.py` output. Greedy, one request in flight, two
-reps per cell, spread is the difference between them. Prefill is cold by
-construction — a fresh prompt body per probe and `cache_prompt: false` — so
-there is no warm-cache row here. *Requested* is the prompt size asked for,
-*counted* is what the server tokenized; the probe overshoots by a few per cent,
-so the measured column is the one to quote.
-
-Prefill, cold:
-
-| Requested tokens | Counted tokens | Gufo pp (tok/s) | Spread | TTFT (ms) |
-| ---: | ---: | ---: | ---: | ---: |
-| 512 | 639 | 1431.5 | 45.2 | 452 |
-| 2,048 | 2,292 | 1983.2 | 1.2 | 1,159 |
-| 8,192 | 8,928 | 2240.2 | 1.5 | 3,990 |
-| 32,768 | 35,389 | 1939.8 | 5.3 | 18,251 |
-
-Decode, DFlash2 draft on (aminya's Q8_0 conversion, not byte-identical to the
-draft used here — see [the derivative note](README.md#tested-derivatives)):
-
-| Depth (tokens) | Counted tokens | Gufo tg (tok/s) | Spread | Draft accept (%) | TTFT (ms) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 78 | 88.2 | 12.4 | 81 | 224 |
-| 4,096 | 4,504 | 52.5 | 1.6 | 49 | 2,110 |
-| 32,768 | 35,389 | 50.5 | 6.3 | 56 | 18,330 |
-
-Plain, same file and same box, on the current `staging` build (`03d06ea` — the
-MMQ K-quant expert decode change, which is the change that touches this file's
-Q6_K experts), served by the engine directly rather than through the router:
+Prefill, cold (a fresh prompt per probe, `cache_prompt: false`):
 
 | Requested tokens | Counted tokens | Gufo pp (tok/s) | Spread | TTFT (ms) |
 | ---: | ---: | ---: | ---: | ---: |
@@ -509,42 +477,18 @@ Q6_K experts), served by the engine directly rather than through the router:
 | 8,192 | 8,928 | 2287.6 | 18.5 | 3,907 |
 | 32,768 | 35,389 | 1982.7 | 7.6 | 17,854 |
 
+Decode, AR, 128 tokens per probe:
+
 | Depth (tokens) | Counted tokens | Gufo tg (tok/s) | Spread | TTFT (ms) |
 | ---: | ---: | ---: | ---: | ---: |
 | 0 | 78 | 43.6 | 0.2 | 211 |
 | 4,096 | 4,504 | 43.4 | 0.2 | 2,059 |
 | 32,768 | 35,389 | 39.8 | 0.4 | 17,886 |
 
-Both decode arms generate 128 tokens per probe, so the two decode tables differ
-only in the draft. Plain decode barely moves with context on this box — 43.6
-from an empty prompt against 39.8 at 32K, 9% across the whole range — so the
-drafted fall from 88.2 to 50.5 is draft acceptance dropping (81% to 56%) rather
-than the base rate collapsing underneath it. DFlash2 is worth 2.02x at empty
-context here, 1.21x at 4K and 1.27x at 32K. Those three ratios cross a build
-(`5faa653b` drafted against `03d06ea` plain) and a serving path, so treat them
-as an upper bound on the draft's own contribution until both arms run on one
-binary.
-
-Prefill moved the other way between the same two runs: +6.3% at 512, +4.4% at
-2,048, +2.1% at 8,192, +2.2% at 32,768 — the same sign in all four cells, which
-is the shape the MMQ expert path predicts and not one noise usually keeps to
-itself. It is still not an isolated A/B: build, toolchain patch level and
-serving path all differ between the two tables.
-
-Against the desktop tables — same GPU family at 128 GB, pinned toolchain,
-UD-Q6_K_XL — the laptop keeps 79% of the desktop's plain decode at empty
-context (43.6 against 55.05), 81% at 4K (43.4 against 53.78) and 84% at 32K
-(39.8 against 47.41). Cold prefill falls further behind: 2071.2 against
-3089.57, two thirds of the desktop, which is where a laptop power envelope
-shows up first. The targets are not the same file either, so read these as
-Strix Halo in a laptop rather than as a desktop-to-laptop ratio.
-
-One caveat on the drafted rows above. That run's environment record logged the
-source tree as `main` for the two 32K cells: a branch restore had already moved
-the checkout, and the invocation recorded the tree rather than the executable.
-All seven drafted cells come from one `5faa653b` build — the restore's binary
-copy landed at 21:47:03.269, 94 ms after the run wrote its table, and the
-`main` build that replaced it refuses this file outright with
-`Missing required Qwen tensor: blk.0.ffn_gate.weight`. The plain run has no
-such ambiguity: it recorded the executable it served, and that checkout's code
-is `03d06ea` with documentation-only changes on top.
+Against the desktop's UD-Q6_K_XL rows above, which have the same expert
+formats, the laptop keeps 78% of plain decode with an empty context (43.6
+against 55.98 tok/s), 79% at 4K (43.4 against 54.65) and 83% at 32K (39.8
+against 48.17). Prefill at about 2K tokens falls to 64% (2071.2 against
+3243.22). A laptop's power limit shows up in prefill first. The files, builds
+and toolchains differ, so read these as what a Strix Halo laptop does, not as
+an exact desktop-to-laptop ratio.

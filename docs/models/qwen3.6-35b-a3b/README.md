@@ -169,23 +169,11 @@ Thinking/template controls and HTTP sampling defaults are described in
 
 ## Tested derivatives
 
-A fine-tune of this architecture is measured beside the four files above:
-
 | File | Weights | Routed experts | Provenance |
 | --- | ---: | --- | --- |
 | [`Accio-Lab_occamy-1.0-Q6_K.gguf`](https://huggingface.co/bartowski/Accio-Lab_occamy-1.0-GGUF/blob/104e2b7e9960c8dc280fc7efad049d55c3697dad/Accio-Lab_occamy-1.0-Q6_K.gguf) | 28.6 GiB | Q6_K and Q8_0, all 40 layers, shared expert Q8_0 | Occamy 1.0, a fine-tune of `Qwen/Qwen3.6-35B-A3B` (Apache-2.0) |
 
-This is the file that exercises the `Q6_K`/`Q8_0` routed-expert path end to
-end: it carries the same `qwen35moe` architecture over the same 40 layers as
-the base model, so nothing in the runner is specific to it beyond the expert
-formats.
-It loads on the branch that adds `qwen35moe`; on `main` (`8c1eeb98`) the same
-file fails at load with `Missing required Qwen tensor: blk.0.ffn_gate`, where
-the Qwen path knows only the dense expert shape. Its measured rows are in
+Occamy keeps this model's `qwen35moe` architecture and 40 layers, and its
+expert formats match UD-Q6_K_XL's, so it runs through the same paths. Its
+laptop measurements are in
 [Benchmarks](BENCHMARKS.md#a-second-machine-asus-proart-px13-laptop).
-
-The DFlash2 rows there used `Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` from
-[`incoai/Qwen3.6-35B-A3B-DFlash2-GGUF`](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2-GGUF)
-(570,468,608 bytes). That repo is gated; the public aminya conversion above is
-570,468,544 bytes, so the two are different packagings of the same draft
-quantization rather than the same file.
