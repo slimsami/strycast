@@ -82,7 +82,10 @@ def launcher(directory, name, loader, libraries, environment, depth=1):
     text += f'root=$(CDPATH= cd -- "$here/{"/".join([".."] * depth)}" && pwd -P)\n'
     text += 'unset LD_LIBRARY_PATH\n'
     for key, value in environment.items():
-        text += f'export {key}="$root/{value}"\n'
+        # Paths beside the launcher stay relative to it: a release renames
+        # the bundle's executable directory.
+        base = '$here' if value.startswith('./') else '$root'
+        text += f'export {key}="{base}/{value.removeprefix("./")}"\n'
     paths = ':'.join('$root/' + path for path in libraries)
     text += f'exec "$root/{loader}" --library-path "{paths}" "$here/libexec/{name}" "$@"\n'
     script.write_text(text)
@@ -173,11 +176,11 @@ def pack(package, revision, destination):
     for name in ('ffmpeg', 'ffprobe'):
         shutil.copy2(ffmpeg[0] / 'bin' / name, destination / 'libexec' / name)
         launcher(destination, name, loader, libraries, {})
-        environment['GUFO_' + name.upper()] = destination.relative_to(root).as_posix() + '/' + name
+        environment['GUFO_' + name.upper()] = './' + name
     # The bundled loader is the process image, so Gufo cannot find its NPU
     # designs beside the executable; point it at the copied share directory.
     if (destination / 'share/gufo/npu').is_dir():
-        environment['GUFO_NPU_DESIGNS'] = destination.relative_to(root).as_posix() + '/share/gufo/npu'
+        environment['GUFO_NPU_DESIGNS'] = './share/gufo/npu'
     launcher(destination, 'gufo', loader, libraries, environment)
     (destination / 'gufo-server').symlink_to('gufo')
     checksums = {}
@@ -186,7 +189,10 @@ def pack(package, revision, destination):
         (destination / 'tests/libexec').mkdir(parents=True)
         for test in tests:
             shutil.copy2(test, destination / 'tests/libexec' / test.name)
-            launcher(destination / 'tests', test.name, loader, libraries, environment, depth=2)
+            # Paths beside the executable are one level up from tests/.
+            beside = {key: './../' + value.removeprefix('./') if value.startswith('./') else value
+                      for key, value in environment.items()}
+            launcher(destination / 'tests', test.name, loader, libraries, beside, depth=2)
             with test.open('rb') as file:
                 checksums[test.name] = hashlib.file_digest(file, 'sha256').hexdigest()
     executable = destination / 'libexec/gufo'
