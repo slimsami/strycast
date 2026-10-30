@@ -30,6 +30,8 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
     permissions:
       actions: read # the Linux package artifacts
       contents: write # the tag and release
@@ -57,9 +59,34 @@ jobs:
           persist-credentials: false
 
       - name: Publish the release
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.commit.outputs.sha }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: bash tools/ci/strycast-release.sh
+
+  image:
+    name: Publish OCI image
+    needs: release
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # the release bundle
+      packages: write # ghcr.io/<owner>/strycast
+    steps:
+      - name: Check out the release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+
+      - name: Build and push the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+        run: bash tools/ci/strycast-image.sh

@@ -18,7 +18,9 @@ All workflow files below live in `.github/workflows/`.
 | `devlab-linux.yml` | Linux validation | Publish results | GitHub Ubuntu | After authorization/testing, including failure paths when a head revision is available. Publishes the report and `devlab/functional` status. |
 | `devlab-comment.yml` | Functional reporting | Update PR comment | GitHub Ubuntu | Linux validation PR runs starting/completing. Maintains placeholders and publishes fork reports without executing PR code. |
 | `pr-title.yml` | PR title | Validate PR title | GitHub Ubuntu | PR open/edit/reopen/synchronize events targeting main. |
-| `release-please.yml` | Release automation | Prepare, merge and publish release | GitHub Ubuntu | Daily/manual. Waits for repository checks, PR title and `devlab/functional`, then merges/publishes and requests Toolboxes artifacts. |
+| `release-please.yml` | Release automation | Prepare, merge and publish release | GitHub Ubuntu | Gufo only (skipped outside `gufo-org/gufo`). Daily/manual. Waits for repository checks, PR title and `devlab/functional`, then merges/publishes and requests Toolboxes artifacts. |
+| `release.yml` | Strycast release | Publish release | GitHub Ubuntu | After a successful Repository checks push run on main, or manual with a commit. Tags `v<Gufo version>-strycast.<n>` and attaches the Linux bundle the nightly run tested for that tree, else the push run's own build. |
+| `release.yml` | Strycast release | Publish OCI image | GitHub Ubuntu | After the release job, also when the commit was already released. Builds `tools/ci/Containerfile` from the release's bundle, checks `gufo --version`, and pushes `ghcr.io/<owner>/strycast:<version>` and `latest` unless that version exists. |
 
 `devlab/functional` is an aggregate commit status rather than a runner job.
 Correctness failures and consistently slower checked phases fail it. Missing or
