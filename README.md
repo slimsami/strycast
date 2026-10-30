@@ -90,6 +90,17 @@ admin:
 After a rebase, move an open branch onto the new `staging` with
 `git rebase --onto origin/staging archive/staging-<old tag> <branch>`.
 
+### Releases
+
+Every push to `main`, whether a promotion or a rebase, is released once its
+checks pass, by the [Strycast release](.github/workflows/release.yml)
+workflow. It tags the commit `v<Gufo version>-strycast.<n>` (for example
+`v0.26.0-strycast.1`), takes the release notes from the promotion PR, and
+attaches the portable Linux bundle that CI built and tested for that commit.
+The bundle carries its own ROCm runtime, so a Strix Halo machine needs only
+the amdgpu kernel driver. A commit can be released by hand from the workflow's
+"Run workflow" button within three days of its build.
+
 The rest of this README is Gufo's.
 
 ## About Gufo
