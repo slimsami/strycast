@@ -47,9 +47,11 @@ Other community forks of Gufo for Strix Halo. They are not part of Strycast;
 report problems with them in their own repositories.
 
 - [D3rPapts/gufo_windows](https://github.com/D3rPapts/gufo_windows): a native
-  Windows 11 build for 64 GiB Strix Halo machines, with SSD expert streaming,
-  UD-Q3_K_XL for Qwen3.8 Flash-Next, MiniMax H3 (first/last frame and the
-  turbo LoRA) and Wan 2.2 TI2V-5B.
+  Windows 11 build for 64 GiB Strix Halo machines, with one router port for
+  text, image (Qwen-Image 2.1 with true CFG and multi-reference edits,
+  MOSS-Image), video (MiniMax H3, Wan 2.2, Wan 2.1 camera moves) and audio
+  (Qwen3-TTS, ACE-Step), live previews, a ComfyUI-compatible API, SSD expert
+  streaming and UD-Q3_K_XL for Qwen3.8 Flash-Next.
 - [neuhaus/gufo](https://github.com/neuhaus/gufo): Gufo RDMA for two Strix
   Halo machines linked by InfiniBand, RoCE v2 or USB4, with tensor parallelism,
   so Qwen3.8 Flash-Next runs at Q8 with longer contexts.
