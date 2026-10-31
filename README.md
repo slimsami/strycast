@@ -52,6 +52,10 @@ report problems with them in their own repositories.
   MOSS-Image), video (MiniMax H3, Wan 2.2, Wan 2.1 camera moves) and audio
   (Qwen3-TTS, ACE-Step), live previews, a ComfyUI-compatible API, SSD expert
   streaming and UD-Q3_K_XL for Qwen3.8 Flash-Next.
+- [franzmoca/gufo](https://github.com/franzmoca/gufo): DeepSeek-V4.1-Flash
+  (763B) on a single 128 GB Strix Halo, at IQ1_M in GPU memory or IQ2_XXS with
+  experts streamed from SSD, and Gemma 4 26B-A4B and 31B, with MTP and image
+  input.
 - [neuhaus/gufo](https://github.com/neuhaus/gufo): Gufo RDMA for two Strix
   Halo machines linked by InfiniBand, RoCE v2 or USB4, with tensor parallelism,
   so Qwen3.8 Flash-Next runs at Q8 with longer contexts.
