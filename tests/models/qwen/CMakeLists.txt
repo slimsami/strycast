@@ -24,6 +24,28 @@ foreach(test qwen_tokenizer_test qwen_chat_template_test)
     GUFO_ORNITH_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/tests/models/qwen/tokenization/ornith_chat_template.jinja")
 endforeach()
 
+add_qwen_cpu_test(qwen_flint_weights_test
+  tests/models/qwen/flint_weights_test.cpp
+  "cpu;models;qwen;flint;weights")
+
+add_qwen_cpu_test(qwen_dflash_weights_test
+  tests/models/qwen/dflash_weights_test.cpp
+  "cpu;models;qwen;dflash;weights")
+
+add_qwen_cpu_test(qwen_flint_attention_test
+  tests/models/qwen/cpu/flint_attention_test.cpp
+  "cpu;models;qwen;flint;attention")
+
+# F-K1 (6.1) flint_layer_probe: the per-layer diagnostic doubles as a
+# real-artifact CPU regression (finite norms, live MoE branch, window/rope
+# pattern vs config). Env-gated: skips (77) without GUFO_FLINT_GGUF.
+add_executable(flint_layer_probe ${PROJECT_SOURCE_DIR}/tools/flint/flint_debug_layer.cpp)
+target_link_libraries(flint_layer_probe PRIVATE gufo_core)
+add_test(NAME flint_layer_probe COMMAND flint_layer_probe)
+set_tests_properties(flint_layer_probe PROPERTIES
+  LABELS "cpu;models;qwen;flint;probe;real"
+  SKIP_RETURN_CODE 77)
+
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp
   "cpu;models;qwen;oracles")
@@ -88,6 +110,18 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_decode_ops_test
     tests/models/qwen/hip/attention/backend_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;backend")
+  add_qwen_hip_test(qwen_flint_decode_ops_test
+    tests/models/qwen/hip/attention/flint_decode_ops_test.cpp
+    "hip;gpu;kernels;qwen;flint;attention;decode;slow")
+  add_qwen_hip_test(qwen_flint_decode_step_test
+    tests/models/qwen/hip/flint_decode_step_test.cpp
+    "hip;gpu;kernels;qwen;flint;decode;step;slow")
+  add_qwen_hip_test(qwen_flint_moe_wmma_ops_test
+    tests/models/qwen/hip/flint_moe_wmma_ops_test.cpp
+    "hip;gpu;kernels;qwen;flint;moe;wmma;slow")
+  add_qwen_hip_test(qwen_flint_real_smoke_test
+    tests/models/qwen/hip/flint_real_smoke_test.cpp
+    "hip;gpu;kernels;qwen;flint;decode;real;slow")
   add_qwen_hip_test(qwen_attention_long_context_ops_test
     tests/models/qwen/hip/attention/long_context_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context")

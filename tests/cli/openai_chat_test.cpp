@@ -626,6 +626,119 @@ void TestToolCallsAreStructured() {
          "Required tool choice reaches the model backend");
 }
 
+void TestFlintToolCalls() {
+  const char* tools = R"([{"type":"function","function":{
+      "name":"f","parameters":{"type":"object","properties":{
+        "text":{"type":"string"},"count":{"type":"integer"},
+        "flag":{"type":"boolean"},"tags":{"type":"array"},
+        "filter":{"type":"object"}}}}}])";
+  struct Case {
+    const char* raw;
+    std::size_t calls;
+    const char* arguments;
+  };
+  const Case cases[] = {
+      // Basic call: a string stays raw, an integer is JSON.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>42</arg_value>"
+       "<arg_key>count</arg_key><arg_value>42</arg_value></tool_call>",
+       1, R"({"text":"42","count":42})"},
+      // Nested object and unicode survive byte-for-byte.
+      {"<tool_call>f<arg_key>filter</arg_key>"
+       "<arg_value>{\"k\": [1, 2, {\"deep\": \"\xe5\x90\x8d\xe5\x89\x8d\"}]}"
+       "</arg_value><arg_key>text</arg_key><arg_value>\xf0\x9f\x9a\x80</"
+       "arg_value>"
+       "</tool_call>",
+       1,
+       "{\"filter\":{\"k\":[1,2,{\"deep\":\"\xe5\x90\x8d\xe5\x89\x8d\"}]},"
+       "\"text\":\"\xf0\x9f\x9a\x80\"}"},
+      // Empty argument list.
+      {"<tool_call>f</tool_call>", 1, "{}"},
+      // An unterminated value is not a complete call.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>partial", 0, ""},
+      // A call whose name is not declared is dropped.
+      {"<tool_call>g<arg_key>text</arg_key><arg_value>x</arg_value>"
+       "</tool_call>",
+       0, ""},
+      // Two sequential calls in one output.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>a</arg_value></tool_call>"
+       "<tool_call>f<arg_key>text</arg_key><arg_value>b</arg_value></"
+       "tool_call>",
+       2, R"({"text":"a"})"},
+  };
+  for (const auto& item : cases) {
+    FakeBackend backend;
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kFlint;
+    backend.pieces = {item.raw};
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"call f"}],
+      "tool_choice":"auto"})");
+    body["tools"] = gufo::json::parse(tools);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "Flint tool request is accepted");
+    const auto parsed = gufo::json::parse(response.body);
+    const auto* choices = parsed.find("choices");
+    const auto* message = choices && !choices->items().empty()
+                              ? choices->items().front().find("message")
+                              : nullptr;
+    const auto* calls = message ? message->find("tool_calls") : nullptr;
+    const std::size_t count =
+        calls && calls->is_array() ? calls->items().size() : 0;
+    Expect(count == item.calls, "Flint tool call count");
+    if (item.calls > 0) {
+      const auto* function = calls->items().front().find("function");
+      Expect(function && function->member_str("name") == "f",
+             "Flint tool name is translated");
+      Expect(function->member_str("arguments") == item.arguments,
+             "Flint tool arguments are translated to JSON");
+    }
+  }
+
+  // F-L5 streaming: a flint call split across pieces must expose an
+  // open-quote partial so the accumulator accepts the final delta. The
+  // closed-quote form of an empty value (`{"text":""`) is not a prefix of
+  // the final arguments and used to abort the stream.
+  {
+    FakeBackend backend;
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kFlint;
+    backend.pieces = {"<tool_call>f<arg_key>text</arg_key><arg_value>",
+                      "partial", "</arg_value></tool_call>"};
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"call f"}],
+      "tool_choice":"auto","stream":true})");
+    body["tools"] = gufo::json::parse(tools);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "Flint streamed tool request is accepted");
+    std::string arguments;
+    std::string finish;
+    response.streaming_body([&](std::string_view chunk) {
+      if (chunk == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(chunk.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        if (const auto* delta = choice.find("delta")) {
+          if (const auto* calls = delta->find("tool_calls")) {
+            for (const auto& call : calls->items()) {
+              if (const auto* function = call.find("function"))
+                arguments += function->member_str("arguments");
+            }
+          }
+        }
+        if (const auto* reason = choice.find("finish_reason");
+            reason && reason->is_string())
+          finish = reason->get_str();
+      }
+      return true;
+    });
+    Expect(arguments == R"({"text":"partial"})",
+           "Flint streamed arguments accumulate to the final JSON");
+    Expect(finish == "tool_calls",
+           "Flint streamed call finishes with tool_calls");
+  }
+}
+
 void TestToolParameterCompatibility() {
   using gufo::json::Value;
   const std::pair<const char*, const char*> cases[] = {
@@ -2172,6 +2285,56 @@ void TestStreamingPromptOpenedReasoning() {
          "Streaming answer switches to content after think end");
   Expect(output.find(R"("content":"Check")") == std::string::npos,
          "Reasoning is never exposed as visible content");
+}
+
+void TestFlintReasoningStreaming() {
+  // F-L6: the flint dialect's think markers must never leak as visible
+  // content, however the stream chunks split them. Every byte boundary is
+  // exercised, including a split inside "<think>" and inside "</think>".
+  const std::string raw =
+      "<think>Check the file, then answer.</think>\n\nThe file is fine.";
+  for (const bool split : {false, true}) {
+    FakeBackend backend;
+    backend.initial_output_state_override =
+        FakeBackend::InitialOutputState::kAuto;
+    if (split) {
+      for (const char byte : raw)
+        backend.pieces.emplace_back(1, byte);
+    } else {
+      backend.pieces = {raw};
+    }
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"check"}],
+      "stream":true})");
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "Flint reasoning stream is accepted");
+    std::string output;
+    std::string reasoning;
+    std::string content;
+    response.streaming_body([&](std::string_view part) {
+      output.append(part);
+      if (part == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(part.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        if (const auto* delta = choice.find("delta")) {
+          reasoning += delta->member_str("reasoning_content");
+          content += delta->member_str("content");
+        }
+      }
+      return true;
+    });
+    // Byte-split pieces emit one delta per byte: judge the channels on
+    // their accumulated text, not on contiguous SSE bytes.
+    Expect(reasoning == "Check the file, then answer.",
+           "Flint reasoning reaches reasoning_content");
+    Expect(content == "The file is fine.",
+           "Flint answer reaches content after the think end");
+    Expect(output.find("<think>") == std::string::npos &&
+               output.find("</think>") == std::string::npos,
+           "Flint reasoning is never exposed as visible content");
+  }
 }
 
 void TestInitialOutputPhases() {
@@ -5989,7 +6152,7 @@ void TestToolTagBoundaries() {
             continue;
           const auto prefix =
               initial == Initial::kContent ? std::string{}
-              : implicit                   ? std::string("Check tags.\n\n")
+              : implicit ? std::string("Check tags.\n\n")
                          : (initial == Initial::kAuto ? "<think>" : "") +
                                std::string("Check tags.</think>\n");
           const auto raw = prefix + call + "\n" + noop;
@@ -6529,10 +6692,12 @@ int main() {
   TestPiReasoningControlsAndOutputFraming();
   TestPiNativeDeepSeekThinkingObject();
   TestStreamingPromptOpenedReasoning();
+  TestFlintReasoningStreaming();
   TestInitialOutputPhases();
   TestReasoningAnswerSeparator();
   TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
+  TestFlintToolCalls();
   TestToolParameterCompatibility();
   TestInvalidToolsFailBeforeGeneration();
   TestResponsesToolStrictness();

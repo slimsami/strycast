@@ -13,23 +13,30 @@
 #include <string_view>
 #include <vector>
 
+#include <algorithm>
+#include <iterator>
+
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/flint_options.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/state.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/flint_gpu_model.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -857,6 +864,66 @@ void GenerateQwenGpuResponse(
   }
 }
 
+void GenerateFlintGpuResponse(
+    const PromptOptions& opt, const hip::FlintGpuModel& model,
+    const tokenization::QwenTokenizer& tokenizer,
+    std::span<const tokenization::TokenId> prompt_tokens) {
+  const auto& config = model.GetConfig();
+  const std::uint32_t max_context = std::min<std::uint32_t>(
+      config.context_length,
+      gufo::core::FlintServedContextCap(config.sliding_window));
+  hip::FlintGpuArena arena(config, max_context);
+  const auto buffers = arena.GetBuffers();
+  std::vector<float> logits(config.vocab_size);
+  std::uint32_t position = 0;
+  const auto sample_argmax = [&logits]() {
+    return static_cast<tokenization::TokenId>(
+        std::distance(logits.begin(),
+                      std::max_element(logits.begin(), logits.end())));
+  };
+  const auto start = std::chrono::steady_clock::now();
+  // Prompt tokens queue on the arena stream; only the final token needs the
+  // logits on the host. Greedy selection is the F-L1 CLI gate.
+  for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
+    const bool last = i + 1 == prompt_tokens.size();
+    hip::ExecuteFlintDecodeStep(model.GetWeights(), prompt_tokens[i], position,
+                                last, buffers, /*timings=*/nullptr,
+                                arena.GetGraphState());
+    if (last) {
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+      HIP_CHECK(hipMemcpy(logits.data(), buffers.logits,
+                          logits.size() * sizeof(float),
+                          hipMemcpyDeviceToHost));
+    }
+    ++position;
+  }
+  std::size_t generated = 0;
+  tokenization::TokenId token = sample_argmax();
+  while (generated < opt.max_tokens && !tokenizer.IsStopToken(token)) {
+    std::cout << tokenizer.DecodeToken(token) << std::flush;
+    ++generated;
+    if (generated >= opt.max_tokens || position >= max_context)
+      break;
+    hip::ExecuteFlintDecodeStep(model.GetWeights(), token, position,
+                                /*compute_logits=*/true, buffers,
+                                /*timings=*/nullptr, arena.GetGraphState());
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    HIP_CHECK(hipMemcpy(logits.data(), buffers.logits,
+                        logits.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    ++position;
+    token = sample_argmax();
+  }
+  std::cout << '\n';
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start).count();
+  if (opt.verbose) {
+    const double rate = seconds > 0 ? generated / seconds : 0;
+    std::cout << "Generated " << generated << " tokens on GPU in " << seconds
+              << "s (" << rate << " tok/s)\n";
+  }
+}
+
 #endif
 
 }  // namespace
@@ -1069,6 +1136,62 @@ int RunPrompt(std::span<const char* const> args) {
         tokenizer, rendered_prompt, 0, rendered_prompt.size(), content_spans,
         {});
   };
+
+  if (reader->GetMetadataString("general.architecture") == "flint") {
+    // F-A4 load branch: flint is registered explicitly so it never falls
+    // through to the qwen or deepseek runtimes. The CLI drives the GPU
+    // decode step greedily; the flint runner serves the HTTP path (F-L1).
+    std::string flint_err;
+    if (!core::ValidateFlintOptions(
+            !opt.vision_model_path.empty() || !opt.image_paths.empty(),
+            !opt.speculative_backend.empty(),
+            /*speculative_lookup=*/false, /*speculative_dflash=*/false,
+            !opt.mtp_model_path.empty(), !opt.dspark_model_path.empty(),
+            &flint_err)) {
+      std::cerr << "Error: " << flint_err << "\n";
+      return 1;
+    }
+#if defined(ENGINE_ENABLE_HIP)
+    auto flint_tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    if (!flint_tokenizer) {
+      std::cerr << "Error loading flint tokenizer: " << err << "\n";
+      return 1;
+    }
+    auto flint_model = hip::FlintGpuModel::CreateFromGguf(reader, &err);
+    if (flint_model == nullptr) {
+      std::cerr << "Error creating flint GPU model: " << err << "\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 1;
+    }
+    PrintModelLoadTime(model_load_start);
+    if (!opt.use_chat_template && rendered_prompt.empty()) {
+      std::cerr << "Error: the flint prompt is empty\n";
+      return 1;
+    }
+    std::vector<tokenization::TokenId> prompt_tokens;
+    if (opt.use_chat_template) {
+      tokenization::ChatTemplateOptions template_options;
+      template_options.max_output_bytes = tokenization::RenderedPromptBoundBytes(
+          core::FlintServedContextCap(flint_model->GetConfig().sliding_window));
+      const auto rendered = tokenization::FlintChatTemplate::RenderAndTokenize(
+          *flint_tokenizer, messages, {}, template_options);
+      if (!rendered) {
+        std::cerr << "Error formatting the flint chat template.\n";
+        return 1;
+      }
+      prompt_tokens = *rendered;
+    } else {
+      prompt_tokens = flint_tokenizer->Encode(rendered_prompt);
+    }
+    GenerateFlintGpuResponse(opt, *flint_model, *flint_tokenizer,
+                             prompt_tokens);
+    return 0;
+#else
+    std::cerr << "Error: flint requires a build with ENGINE_ENABLE_HIP=ON\n";
+    return 1;
+#endif
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {

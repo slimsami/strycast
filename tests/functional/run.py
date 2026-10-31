@@ -259,7 +259,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
                         help="New report directory; existing results are never overwritten")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"), required=True)
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "flint"), required=True)
     parser.add_argument("--suite", action="append", choices=("all", *SUITES), required=True,
                         help="Repeat to select affected suites; use all for an explicit full run")
     parser.add_argument("--expected-input-modalities", choices=("text", "text,image"),
@@ -414,6 +414,18 @@ def main():
         ("legacy-tool-cancel", ["--case", "content-preserve1-sampled0",
                                "--tools", "--legacy-tool-history"]),
     ]
+    if args.sampling_preset == "flint":
+        # Flint always emits a thinking block before content. Dropping the
+        # assistant (or its reasoning) after an interrupt puts the cancel
+        # checkpoint past the resume prefix, so the cache cannot be reused.
+        # Preserve the assistant turn instead, which is the model card's
+        # documented usage ("preserve returned reasoning_content in history").
+        cache_cases[0] = ("text-cancel", ["--case", "content-preserve1-sampled0"])
+    # Flint is a reasoning model: it emits a thinking block before content, so
+    # the fixed interrupt/chat budgets need headroom past the non-reasoning
+    # defaults (256-token interrupt, 8 tokens per disk-spacing turn).
+    content_tokens = 1024 if args.sampling_preset == "flint" else 256
+    spacing_tokens = 512 if args.sampling_preset == "flint" else 8
     if vision:
         image_fixture(output / "red.png")
         cache_cases += [
@@ -476,12 +488,14 @@ def main():
                 for label, extra in cache_cases:
                     if run(label, "continuation.py", [
                             "--url", base_url, "--model", model, "--prefix-repetitions", "16",
+                            "--max-tokens", str(content_tokens),
                             "--output", str(output / (label + ".json")), *extra]):
                         ready_to_restore.append(label)
                 # Retain the window; checkpoint IDs identify fixture-owned writes.
                 spacing_offset = (output / "server.log").stat().st_size
                 spacing = run("disk-spacing", "cache_disk_spacing.py", [
                     "--url", base_url, "--model", model,
+                    "--max-tokens", str(spacing_tokens),
                     "--output", str(output / "disk-spacing.json")])
         if ready_to_restore or spacing:
             startup_started = time.monotonic()
@@ -495,6 +509,7 @@ def main():
                 if spacing:
                     spacing = run("disk-spacing-disk", "cache_disk_spacing.py", [
                         "--url", base_url, "--model", model,
+                        "--max-tokens", str(spacing_tokens),
                         "--restore", str(output / "disk-spacing.json"),
                         "--output", str(output / "disk-spacing-disk.json")])
         if spacing:

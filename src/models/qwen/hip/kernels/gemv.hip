@@ -23,7 +23,8 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     void Wave32GEMVKernel_1Row(const hip_bfloat16* __restrict__ A,
                                const float* __restrict__ x,
                                float* __restrict__ y, std::size_t M,
-                               std::size_t K) {
+                               std::size_t K,
+                               const float* __restrict__ residual) {
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
@@ -62,8 +63,7 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 
   if (lane_id == 0) {
-    const float r = 0.0F;
-    y[m] = dot + r;
+    y[m] = dot + (residual != nullptr ? residual[m] : 0.0F);
   }
 }
 
@@ -74,20 +74,22 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
                                     core::GgmlType a_type,
                                     const float* __restrict__ x_rows,
                                     float* __restrict__ y_rows, std::size_t M,
-                                    std::size_t K) {
+                                    std::size_t K,
+                                    const float* __restrict__ residual) {
   const std::size_t m = blockIdx.x;
   if (m >= M)
     return;
   const float* x = x_rows + (static_cast<std::size_t>(blockIdx.y) * K);
   float* y = y_rows + (static_cast<std::size_t>(blockIdx.y) * M);
-  FastGEMVBlockRow(A, a_type, x, y, m, K);
+  FastGEMVBlockRow(A, a_type, x, y, m, K, residual);
 }
 
 namespace {
 
 void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
                       core::GgmlType a_type, const float* x, float* y,
-                      std::size_t M, std::size_t K, hipStream_t stream) {
+                      std::size_t M, std::size_t K, hipStream_t stream,
+                      const float* residual) {
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
   if (route == models::qwen::QwenGemmRoute::kHipBf16Wave32Single) {
@@ -96,7 +98,7 @@ void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
     const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
     const std::size_t grid = (M + kWavesPerBlock - 1) / kWavesPerBlock;
     Wave32GEMVKernel_1Row<kWavesPerBlock>
-        <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K);
+        <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K, residual);
     return;
   }
 
@@ -107,7 +109,8 @@ void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
               route == models::qwen::QwenGemmRoute::kHipBf16Baseline512
           ? 512
           : 256;
-  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, a_type, x, y, M, K);
+  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, a_type, x, y, M, K,
+                                                    residual);
 }
 
 // The vendored vector kernel reads a routed expert id per row; a dense weight
@@ -174,7 +177,8 @@ void LaunchGEMVRows(const void* A, core::GgmlType a_type, const float* x,
       const dim3 grid(static_cast<unsigned int>(M),
                       static_cast<unsigned int>(rows));
       FastGEMVBlockKernel<<<grid, block_size, 0, stream>>>(A, a_type, x, y, M,
-                                                           K);
+                                                           K,
+                                                           /*residual=*/nullptr);
       return;
     }
     default:
@@ -202,7 +206,31 @@ void LaunchGEMV(const void* A, core::GgmlType a_type, const float* x, float* y,
     case models::qwen::QwenGemmRoute::kHipBf16Baseline256:
     case models::qwen::QwenGemmRoute::kHipBf16Baseline512:
     case models::qwen::QwenGemmRoute::kHipBf16Wave32Single:
-      ExecuteDenseGemv(resolution.route, A, a_type, x, y, M, K, stream);
+      ExecuteDenseGemv(resolution.route, A, a_type, x, y, M, K, stream,
+                       /*residual=*/nullptr);
+      return;
+    default:
+      std::abort();
+  }
+}
+
+void LaunchGEMVResidual(const void* A, core::GgmlType a_type, const float* x,
+                        float* residual_and_out, std::size_t M, std::size_t K,
+                        hipStream_t stream, models::qwen::QwenGemmMode mode) {
+  const auto resolution = models::qwen::ResolveQwenGemmRoute(
+      {.type = a_type, .batch_size = 1, .m = M, .k = K, .mode = mode});
+  switch (resolution.route) {
+    case models::qwen::QwenGemmRoute::kHipQuantDirect:
+      LaunchQ8KBlockGEMV(A, a_type, x, residual_and_out, M, K, stream,
+                         residual_and_out);
+      return;
+    case models::qwen::QwenGemmRoute::kHipF32Baseline256:
+    case models::qwen::QwenGemmRoute::kHipF32Baseline512:
+    case models::qwen::QwenGemmRoute::kHipBf16Baseline256:
+    case models::qwen::QwenGemmRoute::kHipBf16Baseline512:
+    case models::qwen::QwenGemmRoute::kHipBf16Wave32Single:
+      ExecuteDenseGemv(resolution.route, A, a_type, x, residual_and_out, M, K,
+                       stream, residual_and_out);
       return;
     default:
       std::abort();
