@@ -1,5 +1,12 @@
 # Releasing
 
+> **Strycast:** this page describes Gufo's own release process, which is
+> skipped outside `gufo-org/gufo`. Strycast releases every push to `main` as
+> `v<Gufo version>-strycast.<n>`, with a Linux bundle and an OCI image
+> (`ghcr.io/slimsami/strycast`), through `.github/workflows/release.yml`; see
+> [Nightly run and releases](../README.md#nightly-run-and-releases) and
+> [CI workflows](CI.md). The pull request title rules below still apply.
+
 Gufo uses squash merges and Conventional Commit pull request titles to keep
 `main` machine-readable. A pull request may contain arbitrary work-in-progress
 commits; its title becomes the single commit retained on `main`.
