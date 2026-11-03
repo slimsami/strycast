@@ -368,13 +368,34 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return false;
   };
   const auto layer_supported = [&](const LayerWeights& l) {
-    return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
-           supported(l.ffn_down_exps);
+    if (!supported(l.ffn_gate_exps) || !supported(l.ffn_up_exps) ||
+        !supported(l.ffn_down_exps))
+      return false;
+    if (IqExpertLayoutSupported(w.config, l.ffn_gate_exps.type,
+                                l.ffn_up_exps.type, l.ffn_down_exps.type))
+      return true;
+    if (error_msg != nullptr)
+      *error_msg = "unsupported HIP expert layout for IQ formats: " +
+                   std::string(l.ffn_gate_exps.name);
+    return false;
   };
+  // MTP catch-up runs 9-32 non-prefill rows, which take the tiled MMQ route,
+  // so the block cannot hold IQ formats.
+  const auto mtp_block_supported = [&](const LayerWeights& l) {
+    if (!layer_supported(l))
+      return false;
+    if (!IsIqExpert(l.ffn_gate_exps.type) && !IsIqExpert(l.ffn_up_exps.type) &&
+        !IsIqExpert(l.ffn_down_exps.type))
+      return true;
+    if (error_msg != nullptr)
+      *error_msg = "unsupported HIP MTP expert format: " +
+                   std::string(l.ffn_gate_exps.name);
+    return false;
+  };
+  // A tied head has the embedding's type, so the embedding check rejects it.
   if (!supported(w.token_embd) ||
-      (w.output.data == w.token_embd.data && !supported(w.output)) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
-      (mtp != nullptr && !layer_supported(mtp->block))) {
+      (mtp != nullptr && !mtp_block_supported(mtp->block))) {
     return nullptr;
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());

@@ -17,6 +17,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -236,27 +237,38 @@ void CheckRouted(const Format& f, int rows, int cols, int tokens, int used) {
                " changed SwiGLU bits");
   }
 
-  // Tiled MMQ (prefill fallback).
-  using Raw = int (*)(const void*, const float*, const std::int32_t*, float*,
-                      int, int, int, int, int, hipStream_t);
-  const Raw raw = f.type == GgmlType::kIQ3_S    ? qfn_mmq_iq3_s_moe_raw
-                  : f.type == GgmlType::kIQ4_NL ? qfn_mmq_iq4_nl_moe_raw
-                                                : qfn_mmq_iq4_xs_moe_raw;
-  CheckHip(hipMemset(out, 0, count * sizeof(float)), "clear MMQ output");
-  Expect(!raw(wa, dx, di, out, rows, cols, tokens, experts, used, nullptr),
-         tag + ": tiled MMQ launch failed");
-  CheckHip(hipDeviceSynchronize(), "tiled MMQ");
-  const double mmq_error = RelativeError(Download(out, count), ref_a);
-  Expect(mmq_error < 1e-2, tag + ": MMQ error " + std::to_string(mmq_error));
-
   std::cout << tag << " tokens=" << tokens << " used=" << used
-            << ": vector rel err " << vec_error << ", MMQ rel err " << mmq_error
-            << '\n';
+            << ": vector rel err " << vec_error << '\n';
   for (void* p : {static_cast<void*>(wa), static_cast<void*>(wb),
                   static_cast<void*>(dx), static_cast<void*>(di),
                   static_cast<void*>(single_a), static_cast<void*>(single_b),
                   static_cast<void*>(out), static_cast<void*>(out_b)})
     CheckHip(hipFree(p), "free");
+}
+
+/// Layouts the expert kernels can run: IQ formats must take the routed F16 path
+/// at prefill, because they have no tiled MMQ route.
+void CheckIqExpertLayouts() {
+  gufo::models::qwen38_flash_next::Config c;
+  c.hidden_size = 2560;
+  c.expert_ff = 640;
+  const auto ok = [&](GgmlType gate, GgmlType up, GgmlType down) {
+    return q::IqExpertLayoutSupported(c, gate, up, down);
+  };
+  using enum GgmlType;
+  Expect(ok(kIQ3_S, kIQ3_S, kIQ4_NL), "IQ3_S gate/up with IQ4_NL down");
+  Expect(ok(kIQ3_S, kIQ3_S, kQ8_0), "IQ3_S gate/up with Q8_0 down");
+  Expect(ok(kIQ4_XS, kIQ4_XS, kIQ4_NL), "IQ4_XS gate/up with IQ4_NL down");
+  Expect(ok(kQ4_K, kQ4_K, kIQ4_NL), "Q4_K gate/up with IQ4_NL down");
+  Expect(ok(kQ8_0, kQ8_0, kQ8_0), "layouts without IQ formats stay allowed");
+  Expect(ok(kQ4_K, kQ8_0, kQ5_1), "mixed layouts without IQ stay allowed");
+  Expect(!ok(kIQ3_S, kIQ4_XS, kIQ4_NL), "mismatched IQ gate/up");
+  Expect(!ok(kIQ3_S, kQ4_K, kIQ4_NL), "IQ gate with another up format");
+  Expect(!ok(kIQ4_NL, kIQ4_NL, kIQ4_NL), "IQ4_NL gate/up");
+  Expect(!ok(kIQ3_S, kIQ3_S, kIQ4_XS), "IQ4_XS down");
+  Expect(!ok(kQ4_K, kQ4_K, kIQ3_S), "IQ3_S down");
+  c.expert_ff = 641;
+  Expect(!ok(kIQ3_S, kIQ3_S, kIQ4_NL), "IQ experts outside the WMMA shape");
 }
 
 /// Q6_K head: 1–8 rows per launch, each row bitwise equal to a one-row
@@ -315,6 +327,7 @@ int main() {
   try {
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("qfn_mmq_init failed");
+    CheckIqExpertLayouts();
     // Gate/up view (top-k slots), with a ragged row count.
     for (int rows : {64, 65}) {
       CheckRouted(kIQ3_S, rows, 2560, 33, 3);

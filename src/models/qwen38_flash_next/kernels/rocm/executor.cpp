@@ -1910,17 +1910,6 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
       case GgmlType::kQ8_0:
         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
-      case GgmlType::kIQ3_S:
-        rc = qfn_mmq_iq3_s_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kIQ4_NL:
-        rc =
-            qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kIQ4_XS:
-        rc =
-            qfn_mmq_iq4_xs_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
       default:
         break;
     }
@@ -2841,17 +2830,9 @@ bool Executor::JoinSide(std::string* error_msg) const {
 }
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
-  const Config& c = config();
   return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-          l.ffn_gate_exps.type == GgmlType::kQ5_K ||
-          l.ffn_gate_exps.type == GgmlType::kIQ3_S ||
-          l.ffn_gate_exps.type == GgmlType::kIQ4_XS) &&
-         l.ffn_up_exps.type == l.ffn_gate_exps.type &&
-         (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-          l.ffn_down_exps.type == GgmlType::kQ8_0 ||
-          l.ffn_down_exps.type == GgmlType::kIQ4_NL) &&
-         c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+         WmmaExpertLayout(config(), l.ffn_gate_exps.type, l.ffn_up_exps.type,
+                          l.ffn_down_exps.type);
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,

@@ -317,7 +317,8 @@ const char* TypeName(q::WeightType type) {
 /// Runs the MMQ tier and the F16 route over the same routing and reports
 /// the worst absolute errors of the F16 route against the tier and against
 /// an F64 reference over the dequantized weights (the tier's own F64 gap is
-/// its activation quantization).
+/// its activation quantization). IQ formats have no MMQ tier, so only the F64
+/// reference checks them.
 Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::size_t experts, std::size_t m, std::size_t k,
            std::uint32_t seed, std::uint32_t tile_rows = 48,
@@ -328,6 +329,7 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
       : type == q::WeightType::kQ5_1 ? MakeQ5_1(experts, m, k, seed)
                                      : MakeQ8_0(experts, m, k, seed);
+  const bool has_mmq = !IsIq(type);
   const std::size_t slots = n_tokens * used;
   // Skewed top-k without replacement: the low experts see most rows.
   std::vector<std::int32_t> ids(slots);
@@ -370,18 +372,14 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   std::vector<float> zero_out(slots * m, 0.0F);
   float* d_mmq = Upload(zero_out);
 
-  const auto mmq_raw = type == q::WeightType::kQ4_K     ? qfn_mmq_q4_K_moe_raw
-                       : type == q::WeightType::kQ5_K   ? qfn_mmq_q5_K_moe_raw
-                       : type == q::WeightType::kQ5_1   ? qfn_mmq_q5_1_moe_raw
-                       : type == q::WeightType::kIQ3_S  ? qfn_mmq_iq3_s_moe_raw
-                       : type == q::WeightType::kIQ4_XS ? qfn_mmq_iq4_xs_moe_raw
-                       : type == q::WeightType::kIQ4_NL ? qfn_mmq_iq4_nl_moe_raw
-                                                        : qfn_mmq_q8_0_moe_raw;
-  const int rc =
+  const auto mmq_raw = type == q::WeightType::kQ4_K   ? qfn_mmq_q4_K_moe_raw
+                       : type == q::WeightType::kQ5_K ? qfn_mmq_q5_K_moe_raw
+                       : type == q::WeightType::kQ5_1 ? qfn_mmq_q5_1_moe_raw
+                                                      : qfn_mmq_q8_0_moe_raw;
+  if (has_mmq &&
       mmq_raw(d_w, d_x, d_ids, d_mmq, static_cast<int>(m), static_cast<int>(k),
               static_cast<int>(n_tokens), static_cast<int>(experts),
-              static_cast<int>(used), nullptr);
-  if (rc != 0) {
+              static_cast<int>(used), nullptr) != 0) {
     throw std::runtime_error("MMQ routed GEMM failed");
   }
   // The F16 route over the same assignments: F16 activation rows and the
@@ -596,21 +594,26 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       if (!std::isfinite(f)) {
         throw std::runtime_error("routed F16 output is not finite");
       }
-      const float v = mmq[s * m + row];
-      r.vs_mmq = std::max(r.vs_mmq, std::abs(static_cast<double>(v - f)));
       r.vs_ref = std::max(r.vs_ref, std::abs(ref - f));
-      r.mmq_vs_ref = std::max(r.mmq_vs_ref, std::abs(ref - v));
       r.scale = std::max(r.scale, std::abs(ref));
-      r.mmq_sq_error += (ref - v) * (ref - v);
       r.ref_sq += ref * ref;
+      if (has_mmq) {
+        const float v = mmq[s * m + row];
+        r.vs_mmq = std::max(r.vs_mmq, std::abs(static_cast<double>(v - f)));
+        r.mmq_vs_ref = std::max(r.mmq_vs_ref, std::abs(ref - v));
+        r.mmq_sq_error += (ref - v) * (ref - v);
+      }
     }
   }
   std::cout << TypeName(type) << " routed n=" << n_tokens << " used=" << used
             << " E=" << experts << " m=" << m << " k=" << k
-            << ": worst |F16 - MMQ| " << r.vs_mmq << ", worst |F16 - F64| "
-            << r.vs_ref << ", worst |MMQ - F64| " << r.mmq_vs_ref
-            << ", MMQ NMSE " << r.mmq_sq_error / r.ref_sq << " (scale "
-            << r.scale << ", widest bucket " << max_bucket << ")\n";
+            << ": worst |F16 - F64| " << r.vs_ref;
+  if (has_mmq) {
+    std::cout << ", worst |F16 - MMQ| " << r.vs_mmq << ", worst |MMQ - F64| "
+              << r.mmq_vs_ref << ", MMQ NMSE " << r.mmq_sq_error / r.ref_sq;
+  }
+  std::cout << " (scale " << r.scale << ", widest bucket " << max_bucket
+            << ")\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_ids), static_cast<void*>(d_counts),
                   static_cast<void*>(d_bounds), static_cast<void*>(d_cursors),
