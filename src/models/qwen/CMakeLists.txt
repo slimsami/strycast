@@ -9,6 +9,7 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/weights.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/ssm.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/forward.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/flint_forward.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/attention.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/embed.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/ffn.cpp
@@ -74,14 +75,22 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_tile.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma_decode.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_attention_wmma.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe_batch.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/arena.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/detail/weight_regions.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_prefill.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_gpu_model.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_speculative_target.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp

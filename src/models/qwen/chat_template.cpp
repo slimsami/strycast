@@ -549,6 +549,78 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
   return result;
 }
 
+FlintToolCallScan ScanFlintToolCall(std::string_view text) {
+  FlintToolCallScan result;
+  if (!text.starts_with(FlintToolSyntax::kCallOpen))
+    return result;
+  result.matched = true;
+  const std::size_t begin = FlintToolSyntax::kCallOpen.size();
+  result.progress = begin;
+  result.end = begin;
+
+  FlintToolCallSyntax call;
+  std::string_view body = text.substr(begin);
+  // The name is the raw text before the first argument or the closing tag.
+  const auto name_end = body.find(FlintToolSyntax::kArgKeyOpen);
+  const auto close_end = body.find(FlintToolSyntax::kCallClose);
+  const auto name_stop = name_end == std::string_view::npos
+                             ? close_end
+                             : (close_end == std::string_view::npos
+                                    ? name_end
+                                    : std::min(name_end, close_end));
+  if (name_stop == std::string_view::npos)
+    return result;
+  call.name = std::string(TrimAscii(body.substr(0, name_stop)));
+  if (call.name.empty())
+    return result;
+  body.remove_prefix(name_stop);
+
+  bool valid = true;
+  while (body.starts_with(FlintToolSyntax::kArgKeyOpen)) {
+    body.remove_prefix(FlintToolSyntax::kArgKeyOpen.size());
+    const auto key_end = body.find(FlintToolSyntax::kArgKeyClose);
+    if (key_end == std::string_view::npos) {
+      valid = false;
+      break;
+    }
+    const std::string spelled(body.substr(0, key_end));
+    body.remove_prefix(key_end + FlintToolSyntax::kArgKeyClose.size());
+    if (!body.starts_with(FlintToolSyntax::kArgValueOpen)) {
+      valid = false;
+      break;
+    }
+    body.remove_prefix(FlintToolSyntax::kArgValueOpen.size());
+    const auto value_end = body.find(FlintToolSyntax::kArgValueClose);
+    if (value_end == std::string_view::npos) {
+      // An unterminated value holds back a possible partial closing delimiter
+      // so a streamed chunk boundary cannot expose it as argument data.
+      if (!spelled.empty()) {
+        call.unfinished =
+            FlintToolCallParameter{.name = spelled,
+                                   .value = std::string(BeforePartialDelimiter(
+                                       body, FlintToolSyntax::kArgValueClose)),
+                                   .progress = result.progress};
+      }
+      valid = false;
+      break;
+    }
+    call.parameters.push_back(
+        FlintToolCallParameter{.name = spelled,
+                               .value = std::string(body.substr(0, value_end)),
+                               .progress = result.progress});
+    body.remove_prefix(value_end + FlintToolSyntax::kArgValueClose.size());
+    result.progress = static_cast<std::size_t>(body.data() - text.data());
+    result.end = result.progress;
+  }
+  if (valid && body.starts_with(FlintToolSyntax::kCallClose)) {
+    result.progress += FlintToolSyntax::kCallClose.size();
+    result.end = result.progress;
+    call.complete = true;
+  }
+  result.call = std::move(call);
+  return result;
+}
+
 bool QwenChatTemplate::IsOrnithTemplate(std::string_view raw_template) {
   if (TemplateSha256(raw_template) == OrnithTemplateSha256())
     return true;
@@ -994,6 +1066,261 @@ std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
   tok_opts.parse_special_tokens = true;
   return EncodeRendered(tokenizer, *rendered, 0, rendered->size(),
                         content_spans, tok_opts);
+}
+
+// ---------------------------------------------------------------- flint
+
+namespace {
+
+/// flint_text(): strip NUL and the thinking markers, then escape the seven
+/// turn markers so client text can never spell framing.
+std::string EscapeFlintText(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    if (c != '\0') {
+      out += c;
+    }
+  }
+  const auto erase_all = [](std::string* target, std::string_view needle) {
+    std::size_t pos = 0;
+    while ((pos = target->find(needle, pos)) != std::string::npos) {
+      target->erase(pos, needle.size());
+    }
+  };
+  erase_all(&out, "\x3Cthink>");
+  erase_all(&out, "</think>");
+
+  constexpr std::string_view kMarkers[] = {
+      "<|begin_of_text|>", "<|end_of_text|>", "<|system|>",
+      "<|developer|>",     "<|user|>",        "<|assistant|>",
+      "<|observation|>",
+  };
+  for (const std::string_view marker : kMarkers) {
+    std::string escaped;
+    escaped.reserve(marker.size());
+    for (const char c : marker) {
+      if (c == '<') {
+        escaped += "&lt;";
+      } else if (c == '>') {
+        escaped += "&gt;";
+      } else {
+        escaped += c;
+      }
+    }
+    std::size_t pos = 0;
+    while ((pos = out.find(marker, pos)) != std::string::npos) {
+      out.replace(pos, marker.size(), escaped);
+      pos += escaped.size();
+    }
+  }
+  return out;
+}
+
+void AppendJsonString(std::string* out, std::string_view value) {
+  *out += '"';
+  for (const char c : value) {
+    switch (c) {
+      case '"':
+        *out += "\\\"";
+        break;
+      case '\\':
+        *out += "\\\\";
+        break;
+      case '\n':
+        *out += "\\n";
+        break;
+      case '\r':
+        *out += "\\r";
+        break;
+      case '\t':
+        *out += "\\t";
+        break;
+      default:
+        *out += c;
+    }
+  }
+  *out += '"';
+}
+
+/// The template serialises `tool.function` with tojson(ensure_ascii=False),
+/// preserving the client's key order; the compiled form rebuilds that object
+/// from the parsed fields in the same order.
+std::string ToolFunctionJson(const ChatTool& tool) {
+  std::string out = "{\"name\": ";
+  AppendJsonString(&out, tool.name);
+  out += ", \"description\": ";
+  AppendJsonString(&out, tool.description);
+  out += ", \"parameters\": ";
+  out += tool.parameters_json.empty() ? "{}" : tool.parameters_json;
+  out += '}';
+  return out;
+}
+
+std::string FlintToolPreamble(std::span<const ChatTool> tools) {
+  std::string out =
+      "<|system|>\n# Tools\n\nYou may call one or more functions to assist "
+      "with the user query.\n\nYou are provided with function signatures "
+      "within <tools></tools> XML tags:\n<tools>";
+  for (const ChatTool& tool : tools) {
+    out += ToolFunctionJson(tool);
+  }
+  out +=
+      "</tools>\n\nFor each function call, output the function name and "
+      "arguments within the following XML format:\n"
+      "<tool_call>";
+  out += "{function-name}";
+  out += "<arg_key>";
+  out += "{arg-key-1}";
+  out += "</arg_key>";
+  out += "<arg_value>";
+  out += "{arg-value-1}";
+  out += "</arg_value>";
+  out += "...</tool_call>\n";
+  return out;
+}
+
+std::string_view FlintRoleMarker(ChatRole role) noexcept {
+  switch (role) {
+    case ChatRole::kSystem:
+    case ChatRole::kDeveloper:
+      // llama.cpp normalises a developer turn onto the system branch before
+      // rendering, so the template's <|developer|> branch is never reached.
+      return "<|system|>";
+    case ChatRole::kUser:
+      return "<|user|>";
+    case ChatRole::kAssistant:
+      return "<|assistant|>";
+    case ChatRole::kTool:
+      return "<|observation|>";
+  }
+  return "<|user|>";
+}
+
+}  // namespace
+
+std::string_view FlintChatTemplate::PinnedTemplateSha256() noexcept {
+  return "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466";
+}
+
+bool FlintChatTemplate::ValidateGgufTemplate(const core::GgufReader& reader,
+                                             std::string* error_msg) {
+  const auto raw = reader.GetMetadataString("tokenizer.chat_template");
+  if (!raw.has_value() || raw->empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = "flint GGUF is missing tokenizer.chat_template metadata";
+    }
+    return false;
+  }
+  const std::string sha = TemplateSha256(*raw);
+  if (sha != PinnedTemplateSha256()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "flint chat template SHA-256 is not the pinned version: " + sha;
+    }
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::string> FlintChatTemplate::Render(
+    std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+    const ChatTemplateOptions& options, std::string* error_msg) {
+  if (messages.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = "No messages provided";
+    }
+    return std::nullopt;
+  }
+
+  std::string out;
+  bool tools_pending = !tools.empty();
+  const auto emit_preamble = [&]() {
+    if (!tools_pending) {
+      return;
+    }
+    out += FlintToolPreamble(tools);
+    tools_pending = false;
+  };
+
+  for (std::size_t index = 0; index < messages.size(); ++index) {
+    const ChatMessage& message = messages[index];
+    const bool is_system = message.role == ChatRole::kSystem ||
+                           message.role == ChatRole::kDeveloper;
+    if (!is_system) {
+      emit_preamble();
+    }
+    const bool last = index + 1 == messages.size();
+
+    out += FlintRoleMarker(message.role);
+    switch (message.role) {
+      case ChatRole::kSystem:
+      case ChatRole::kDeveloper:
+      case ChatRole::kUser:
+        out += EscapeFlintText(message.content);
+        break;
+      case ChatRole::kAssistant: {
+        // A trailing assistant turn carries an (empty) reasoning block in the
+        // oracle so the model can continue thinking; mid-conversation turns
+        // only carry one when the client supplied reasoning.
+        const bool think =
+            !message.thought.empty() || (last && !message.content.empty());
+        if (think) {
+          out += "\x3Cthink>";
+          out += message.thought;  // reasoning is not escaped
+          if (last && message.content.empty()) {
+            // Continuation of a reasoning-only turn stays open.
+            break;
+          }
+          out += "</think>";
+        }
+        out += message.content;  // assistant text is not escaped
+        for (const ChatMessage::ToolCall& call : message.tool_calls) {
+          out += "<tool_call>";
+          out += call.name;
+          for (const ChatMessage::ToolArgument& argument : call.arguments) {
+            out += "<arg_key>";
+            out += argument.name;
+            out += "</arg_key><arg_value>";
+            out += argument.value;
+            out += "</arg_value>";
+          }
+          out += "</tool_call>";
+        }
+        break;
+      }
+      case ChatRole::kTool:
+        out += "<tool_response>";
+        out += EscapeFlintText(message.content);
+        out += "</tool_response>";
+        break;
+    }
+  }
+  emit_preamble();
+
+  if (options.add_generation_prompt) {
+    out += "<|assistant|>";
+  }
+  if (out.size() > options.max_output_bytes) {
+    if (error_msg != nullptr) {
+      *error_msg = "Rendered flint prompt (" + std::to_string(out.size()) +
+                   " bytes) exceeds maximum bound (" +
+                   std::to_string(options.max_output_bytes) + " bytes)";
+    }
+    return std::nullopt;
+  }
+  return out;
+}
+
+std::optional<std::vector<TokenId>> FlintChatTemplate::RenderAndTokenize(
+    const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
+    std::span<const ChatTool> tools, const ChatTemplateOptions& options,
+    std::string* error_msg) {
+  const auto rendered = Render(messages, tools, options, error_msg);
+  if (!rendered.has_value()) {
+    return std::nullopt;
+  }
+  return tokenizer.Encode(*rendered);
 }
 
 }  // namespace gufo::tokenization

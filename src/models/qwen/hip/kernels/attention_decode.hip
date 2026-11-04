@@ -9,18 +9,26 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/flint_keycount.hpp"
+#include "src/models/qwen/hip/detail/flint_kv.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
 
+GUFO_FLINT_KEYCOUNT_TU(decode)
+
+using detail::FlintKvLoad;
+using detail::FlintKvOffset;
+
 __global__ void WriteKVCacheKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
+    std::size_t layer_base, std::uint32_t rows, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim) {
   const std::uint32_t kv_h = blockIdx.x;
   if (kv_h >= num_kv_heads)
     return;
@@ -28,11 +36,8 @@ __global__ void WriteKVCacheKernel(
   if (tid >= head_dim)
     return;
 
-  const std::size_t kv_offset =
-      (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-            max_context +
-        pos) *
-       head_dim);
+  const std::size_t kv_offset = FlintKvOffset<float>(
+      layer_base, kv_h, pos, rows, max_context, num_kv_heads, head_dim);
   const float key = k[static_cast<std::size_t>(kv_h) * head_dim + tid];
   const float val = v[static_cast<std::size_t>(kv_h) * head_dim + tid];
   if (k_cache != nullptr) {
@@ -43,11 +48,8 @@ __global__ void WriteKVCacheKernel(
   }
 
   if (k_cache_f16 != nullptr || v_cache_f16 != nullptr) {
-    const std::size_t kv_width =
-        static_cast<std::size_t>(num_kv_heads) * head_dim;
-    const std::size_t f16_offset =
-        ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
-        (static_cast<std::size_t>(kv_h) * head_dim) + tid;
+    const std::size_t f16_offset = FlintKvOffset<__half>(
+        layer_base, kv_h, pos, rows, max_context, num_kv_heads, head_dim);
     if (k_cache_f16 != nullptr) {
       k_cache_f16[f16_offset] = __float2half_rn(key);
     }
@@ -64,12 +66,24 @@ __device__ __forceinline__ float4 LoadHalf4(const __half* source) {
   return make_float4(lower.x, lower.y, upper.x, upper.y);
 }
 
+// Long-position decode attention (defined below LaunchAttention): online
+// tiled kernel for positions past the LDS score-row budget.
+template <typename KVT = float>
+__global__ void FlintDecodeOnlineAttentionKernel(
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ out_context,
+    std::uint32_t layer_idx, std::size_t layer_base, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy);
+
 __global__ void AttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
-    std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
+    float* __restrict__ out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads)
     return;
@@ -82,17 +96,29 @@ __global__ void AttentionKernel(
   const float* q_h = q + (static_cast<std::size_t>(h) * head_dim);
   const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
   const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  // F-D2: the window keeps the last `window` keys; scores use relative
+  // indexing so the LDS row spans only the visible range.
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window) ? seq_len -
+                                                            policy.window
+                                                      : 0;
+  const std::size_t span = seq_len - p_begin;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, static_cast<std::uint32_t>(span));
+  }
+  // F-D1: the sink joins max and denominator (F-D6 order: scale → sink →
+  // softmax → weighted sum) and contributes no value.
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
 
   extern __shared__ float s_scores[];
   __shared__ float s_scratch[256];
 
-  // Step 1: Compute scores for each position p = 0..seq_len-1
-  for (std::size_t p = 0; p < seq_len; ++p) {
-    const std::size_t p_offset =
-        (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-              max_context +
-          p) *
-         head_dim);
+  // Step 1: Compute scores for each position p = p_begin..seq_len-1
+  for (std::size_t p = p_begin; p < seq_len; ++p) {
+    const std::size_t p_offset = FlintKvOffset<float>(
+        layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+        head_dim);
     const float* k_p = k_cache + p_offset;
 
     float dot = 0.0F;
@@ -108,14 +134,14 @@ __global__ void AttentionKernel(
       __syncthreads();
     }
     if (tid == 0) {
-      s_scores[p] = s_scratch[0] * scale;
+      s_scores[p - p_begin] = s_scratch[0] * scale;
     }
     __syncthreads();
   }
 
-  // Step 2: Softmax across s_scores[0..seq_len-1]
+  // Step 2: Softmax across s_scores[0..span-1]
   float local_max = -1e30F;
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     local_max = fmaxf(local_max, s_scores[p]);
   }
   s_scratch[tid] = local_max;
@@ -126,14 +152,20 @@ __global__ void AttentionKernel(
     }
     __syncthreads();
   }
-  const float max_score = s_scratch[0];
+  float max_score = s_scratch[0];
+  if (has_sink) {
+    max_score = fmaxf(max_score, sink);
+  }
   __syncthreads();
 
   float local_sum = 0.0F;
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     const float e = expf(s_scores[p] - max_score);
     s_scores[p] = e;
     local_sum += e;
+  }
+  if (has_sink && tid == 0) {
+    local_sum += expf(sink - max_score);
   }
   s_scratch[tid] = local_sum;
   __syncthreads();
@@ -146,7 +178,7 @@ __global__ void AttentionKernel(
   const float inv_sum_exp = 1.0F / (s_scratch[0] + 1e-9F);
   __syncthreads();
 
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     s_scores[p] *= inv_sum_exp;
   }
   __syncthreads();
@@ -154,14 +186,12 @@ __global__ void AttentionKernel(
   // Step 3: Weighted sum of V
   if (tid < head_dim) {
     float ctx = 0.0F;
-    for (std::size_t p = 0; p < seq_len; ++p) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
+    for (std::size_t p = p_begin; p < seq_len; ++p) {
+      const std::size_t p_offset = FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       const float* v_p = v_cache + p_offset;
-      ctx += s_scores[p] * v_p[tid];
+      ctx += s_scores[p - p_begin] * v_p[tid];
     }
 
     if (gate != nullptr) {
@@ -176,9 +206,10 @@ __global__ void AttentionKernel(
 __global__ void AttentionHalfKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
-    std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
+    float* __restrict__ out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
   const std::uint32_t head = blockIdx.x;
   if (head >= num_heads) {
     return;
@@ -191,17 +222,25 @@ __global__ void AttentionHalfKernel(
   const float* query = q + (static_cast<std::size_t>(head) * head_dim);
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
-  const std::size_t kv_width =
-      static_cast<std::size_t>(num_kv_heads) * head_dim;
+  const std::size_t p_begin =
+      (policy.window != 0 && sequence_length > policy.window)
+          ? sequence_length - policy.window
+          : 0;
+  const std::size_t span = sequence_length - p_begin;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, static_cast<std::uint32_t>(span));
+  }
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[head] : 0.0F;
 
   extern __shared__ float scores[];
   __shared__ float scratch[256];
 
-  for (std::size_t position = 0; position < sequence_length; ++position) {
-    const std::size_t cache_offset =
-        ((static_cast<std::size_t>(layer_idx) * max_context + position) *
-         kv_width) +
-        (static_cast<std::size_t>(kv_head) * head_dim);
+  for (std::size_t position = p_begin; position < sequence_length;
+       ++position) {
+    const std::size_t cache_offset = FlintKvOffset<__half>(
+        layer_base, kv_head, position, policy.kv_rows, max_context, num_kv_heads,
+        head_dim);
     const __half* key = k_cache + cache_offset;
     float dot = 0.0F;
     for (std::size_t dim = tid; dim < head_dim; dim += blockDim.x) {
@@ -216,14 +255,13 @@ __global__ void AttentionHalfKernel(
       __syncthreads();
     }
     if (tid == 0) {
-      scores[position] = scratch[0] * scale;
+      scores[position - p_begin] = scratch[0] * scale;
     }
     __syncthreads();
   }
 
   float local_max = -INFINITY;
-  for (std::size_t position = tid; position < sequence_length;
-       position += blockDim.x) {
+  for (std::size_t position = tid; position < span; position += blockDim.x) {
     local_max = fmaxf(local_max, scores[position]);
   }
   scratch[tid] = local_max;
@@ -234,14 +272,20 @@ __global__ void AttentionHalfKernel(
     }
     __syncthreads();
   }
-  const float max_score = scratch[0];
+  float max_score = scratch[0];
+  if (has_sink) {
+    max_score = fmaxf(max_score, sink);
+  }
+  __syncthreads();
 
   float local_sum = 0.0F;
-  for (std::size_t position = tid; position < sequence_length;
-       position += blockDim.x) {
+  for (std::size_t position = tid; position < span; position += blockDim.x) {
     const float exponential = expf(scores[position] - max_score);
     scores[position] = exponential;
     local_sum += exponential;
+  }
+  if (has_sink && tid == 0) {
+    local_sum += expf(sink - max_score);
   }
   scratch[tid] = local_sum;
   __syncthreads();
@@ -252,20 +296,20 @@ __global__ void AttentionHalfKernel(
     __syncthreads();
   }
   const float inverse_sum = 1.0F / (scratch[0] + 1e-9F);
-  for (std::size_t position = tid; position < sequence_length;
-       position += blockDim.x) {
+  for (std::size_t position = tid; position < span; position += blockDim.x) {
     scores[position] *= inverse_sum;
   }
   __syncthreads();
 
   if (tid < head_dim) {
     float context = 0.0F;
-    for (std::size_t position = 0; position < sequence_length; ++position) {
-      const std::size_t cache_offset =
-          ((static_cast<std::size_t>(layer_idx) * max_context + position) *
-           kv_width) +
-          (static_cast<std::size_t>(kv_head) * head_dim);
-      context += scores[position] * __half2float(v_cache[cache_offset + tid]);
+    for (std::size_t position = p_begin; position < sequence_length;
+         ++position) {
+      const std::size_t cache_offset = FlintKvOffset<__half>(
+          layer_base, kv_head, position, policy.kv_rows, max_context,
+          num_kv_heads, head_dim);
+      context +=
+          scores[position - p_begin] * __half2float(v_cache[cache_offset + tid]);
     }
     if (gate != nullptr) {
       const float gate_value =
@@ -862,20 +906,36 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream, float* split_k_scratch,
-                     bool skip_kv_write) {
+                     bool skip_kv_write,
+                     const detail::FlintKernelPolicy* policy,
+                     std::size_t layer_base) {
+  const std::size_t base =
+      layer_base == kUniformKvBase
+          ? static_cast<std::size_t>(layer_idx) * num_kv_heads * max_context *
+                head_dim
+          : layer_base;
+  const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
   // 1. Write K and V into every non-null selected KV representation across all
   // num_kv_heads. May be skipped when a fused kernel already wrote the cache
   // (opt-c010-qk-rope-kv).
   if (!skip_kv_write) {
     WriteKVCacheKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-        static_cast<__half*>(v_cache_f16), layer_idx, pos, max_context,
+        static_cast<__half*>(v_cache_f16), base, rows, pos, max_context,
         num_kv_heads, head_dim);
   }
 
+  // F-D1 policy gate: the split-K and online kernels carry no sink/window
+  // support, so a flint policy always routes to the baseline kernels.
+  const detail::FlintKernelPolicy kNoPolicy{nullptr, 0};
+  const bool flint_policy = policy != nullptr;
+  const detail::FlintKernelPolicy flint =
+      flint_policy ? *policy : kNoPolicy;
+
   const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
-  const bool split_k_supported = detail::IsSplitKDecodeAttentionSupported(
-      sequence_length, num_heads, num_kv_heads, head_dim);
+  const bool split_k_supported =
+      !flint_policy && detail::IsSplitKDecodeAttentionSupported(
+                           sequence_length, num_heads, num_kv_heads, head_dim);
   // Eight query heads per KV head take the matrix-core route; the FP32
   // reference cache keeps the scalar one.
   if (split_k_supported && split_k_scratch != nullptr &&
@@ -905,7 +965,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
     }
     QwenDecodeSplitKAttentionReduceKernel<<<num_heads, 32, 0, stream>>>(
         gate, split_k_scratch, out_context, num_heads, split_count);
-  } else if (head_dim == 256 && num_kv_heads > 0 &&
+  } else if (!flint_policy && head_dim == 256 && num_kv_heads > 0 &&
              (num_heads % num_kv_heads) == 0) {
     if (k_cache != nullptr && v_cache != nullptr) {
       detail::EmitAttentionDispatch(
@@ -927,15 +987,44 @@ void LaunchAttention(const float* q, const float* k, const float* v,
     }
   } else {
     const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
-    const std::size_t shared_scores_bytes = seq_len * sizeof(float);
+    // The window bounds the visible score row, so the LDS span shrinks with
+    // it; without a window the row covers the full context as before.
+    const std::size_t score_span =
+        (flint.window != 0 && seq_len < flint.window) ? seq_len : flint.window;
+    const std::size_t shared_scores_bytes =
+        (score_span != 0 ? score_span : seq_len) * sizeof(float);
+    if (!detail::BatchedAttentionScoresFitLds(score_span != 0 ? score_span
+                                                              : seq_len)) {
+      // Past the LDS budget the baseline cannot even launch (dynamic
+      // shared > 64 KiB — the device-lost at position 16129). The online
+      // tile kernel needs no score row and carries the same sink/window
+      // semantics; both cache planes supported.
+      if (k_cache_f16 != nullptr && v_cache_f16 != nullptr) {
+        detail::EmitAttentionDispatch("decode_online_flint_f16", "");
+        FlintDecodeOnlineAttentionKernel<__half><<<num_heads, 256, 0, stream>>>(
+            q, static_cast<const __half*>(k_cache_f16),
+            static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
+            base, pos, max_context, num_heads, num_kv_heads, head_dim, flint);
+        return;
+      }
+      if (k_cache != nullptr && v_cache != nullptr) {
+        detail::EmitAttentionDispatch("decode_online_flint", "");
+        FlintDecodeOnlineAttentionKernel<<<num_heads, 256, 0, stream>>>(
+            q, k_cache, v_cache, out_context, layer_idx, base, pos, max_context,
+            num_heads, num_kv_heads, head_dim, flint);
+        return;
+      }
+      throw std::invalid_argument(
+          "flint decode attention past the LDS budget requires a KV cache");
+    }
     if (k_cache != nullptr && v_cache != nullptr) {
       detail::EmitAttentionDispatch(
           "decode_baseline_fp32",
           "decode_split_k_fp32: unsupported_shape; decode_online_fp32: "
           "unsupported_shape");
       AttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
-          q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
-          num_heads, num_kv_heads, head_dim);
+          q, gate, k_cache, v_cache, out_context, layer_idx, base, pos,
+          max_context, num_heads, num_kv_heads, head_dim, flint);
     } else {
       detail::EmitAttentionDispatch(
           "decode_baseline_fp16",
@@ -943,9 +1032,135 @@ void LaunchAttention(const float* q, const float* k, const float* v,
           "unsupported_shape");
       AttentionHalfKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
           q, gate, static_cast<const __half*>(k_cache_f16),
-          static_cast<const __half*>(v_cache_f16), out_context, layer_idx, pos,
-          max_context, num_heads, num_kv_heads, head_dim);
+          static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
+          base, pos, max_context, num_heads, num_kv_heads, head_dim, flint);
     }
+  }
+}
+
+/// Online-tiled decode attention for the flint policy at positions past the
+/// LDS score-row budget (global layers, seq_len x 4 B would exceed 64 KiB):
+/// one block per head, keys walked in fixed-order 256-key tiles, per-tile
+/// block max/sum with the running (m, l) rescale. Same sink semantics as the
+/// baseline (F-D1): the sink seeds the max and the denominator, contributes
+/// no value. The per-thread O accumulator keeps one output dim, so the
+/// final normalization divides one register. Fixed tile order keeps the
+/// summation order independent of anything but position (deterministic).
+template <typename KVT>
+__global__ void FlintDecodeOnlineAttentionKernel(
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ out_context,
+    std::uint32_t layer_idx, std::size_t layer_base, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
+  constexpr std::size_t kTile = 256;
+  const std::uint32_t h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+  const std::uint32_t group_size =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const std::uint32_t kv_h = h / group_size;
+  const std::size_t tid = threadIdx.x;
+
+  const float* q_h = q + static_cast<std::size_t>(h) * head_dim;
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window)
+          ? seq_len - policy.window
+          : 0;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx,
+                             static_cast<std::uint32_t>(seq_len - p_begin));
+  }
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
+
+  __shared__ float s_scores[kTile];
+  __shared__ float s_reduce[kTile];
+  __shared__ float s_m;     // running max
+  __shared__ float s_l;     // running denominator
+  __shared__ float s_alpha; // this tile's O rescale
+
+  float o = 0.0F; // thread-private output dim (tid < head_dim)
+
+  if (tid == 0) {
+    s_m = has_sink ? sink : -INFINITY;
+    s_l = has_sink ? 1.0F : 0.0F;
+  }
+  __syncthreads();
+
+  for (std::size_t tile = p_begin; tile < seq_len; tile += kTile) {
+    const std::size_t tile_end = std::min(tile + kTile, seq_len);
+    const std::size_t n = tile_end - tile;
+    // 1. Scores for this tile (thread-strided over keys, full dot per key).
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const std::size_t p = tile + i;
+      const std::size_t p_offset = FlintKvOffset<KVT>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
+      const KVT* k_p = k_cache + p_offset;
+      float dot = 0.0F;
+      for (std::size_t d = 0; d < head_dim; ++d) {
+        dot += q_h[d] * FlintKvLoad(k_p + d);
+      }
+      s_scores[i] = dot * scale;
+    }
+    __syncthreads();
+    // 2. Tile max -> running max + rescale.
+    float local_max = -INFINITY;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      local_max = fmaxf(local_max, s_scores[i]);
+    }
+    s_reduce[tid] = local_max;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + stride]);
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      const float m_new = fmaxf(s_m, s_reduce[0]);
+      s_alpha = expf(s_m - m_new);
+      s_m = m_new;
+    }
+    __syncthreads();
+    const float alpha = s_alpha;
+    // 3. Exponentiates + tile sum -> running denominator.
+    float local_sum = 0.0F;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const float e = expf(s_scores[i] - s_m);
+      s_scores[i] = e;
+      local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] += s_reduce[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      s_l = s_l * alpha + s_reduce[0];
+    }
+    // 4. O accumulation: rescale then add this tile's weighted V row.
+    if (tid < head_dim) {
+      o *= alpha;
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t v_offset = FlintKvOffset<KVT>(
+            layer_base, kv_h, tile + i, policy.kv_rows, max_context, num_kv_heads,
+            head_dim);
+        o += s_scores[i] * FlintKvLoad(v_cache + v_offset + tid);
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < head_dim) {
+    out_context[static_cast<std::size_t>(h) * head_dim + tid] = o / s_l;
   }
 }
 
@@ -955,12 +1170,16 @@ void LaunchCausalDecodeAttention(
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    std::span<float> scratch) {
+    std::span<float> scratch, const detail::FlintKernelPolicy* policy,
+    std::size_t layer_base) {
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
   float* const split_k_scratch =
       scratch.size() >= row_scratch ? scratch.data() : nullptr;
-  if (batch_size > 1 && scratch.size() / batch_size >= row_scratch &&
+  // F-D1 policy gate: split-K and online carry no sinks/window; a flint
+  // policy takes the per-row baseline route below.
+  if (policy == nullptr && batch_size > 1 &&
+      scratch.size() / batch_size >= row_scratch &&
       split_k_scratch != nullptr &&
       detail::IsSplitKDecodeAttentionSupported(
           static_cast<std::size_t>(start_pos) + 1, num_heads, num_kv_heads,
@@ -996,8 +1215,8 @@ void LaunchCausalDecodeAttention(
   // Without split-K scratch, online attention batches any causal depth.
   // Crossing the split-K threshold retains the per-row route when scratch
   // is available but insufficient to hold all query rows.
-  if (batch_size > 1 && head_dim == 256 && num_kv_heads > 0 &&
-      num_heads % num_kv_heads == 0 &&
+  if (policy == nullptr && batch_size > 1 && head_dim == 256 &&
+      num_kv_heads > 0 && num_heads % num_kv_heads == 0 &&
       (split_k_scratch == nullptr ||
        static_cast<std::size_t>(start_pos) + batch_size <
            detail::kSplitKDecodeAttentionMinContext)) {
@@ -1021,7 +1240,8 @@ void LaunchCausalDecodeAttention(
         gate == nullptr ? nullptr : gate + row * width, k_cache, v_cache,
         k_cache_f16, v_cache_f16, out_context + row * width, layer_idx,
         start_pos + static_cast<std::uint32_t>(row), max_context, num_heads,
-        num_kv_heads, head_dim, stream, split_k_scratch, true);
+        num_kv_heads, head_dim, stream, split_k_scratch, true, policy,
+        layer_base);
   }
 }
 

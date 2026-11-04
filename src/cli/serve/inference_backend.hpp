@@ -15,6 +15,7 @@
 #include "src/models/qwen/dflash_policy.hpp"
 
 namespace gufo::hip {
+class FlintGpuModel;
 class QwenGpuModel;
 }
 
@@ -37,6 +38,7 @@ enum class TextSpeculativeBackend : std::uint8_t {
   kDFlash,
   kDSpark,
   kMtp,  ///< Qwen MTP draft block
+  kLookup,  ///< Flint prompt-lookup (no draft model)
 };
 
 struct TextSpeculativeConfig {
@@ -92,6 +94,17 @@ public:
   /// Installs a previously loaded model without duplicating mapped weights.
   bool load(std::shared_ptr<const hip::QwenGpuModel> model, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
+
+  /// Installs a previously loaded flint GPU model with request-owned arenas.
+  bool load(std::shared_ptr<const hip::FlintGpuModel> model,
+            std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+            std::string* error, std::uint32_t max_context = 0,
+            std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},

@@ -27,6 +27,7 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/models/qwen/hip/dflash_target.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -85,7 +86,7 @@ struct QwenGpuMemoryUsage {
 };
 
 /// Immutable GPU-visible Qwen model resources shared by executor sessions.
-class QwenGpuModel {
+class QwenGpuModel : public DFlashTargetWeights {
 public:
   QwenGpuModel(std::shared_ptr<const core::GgufReader> reader,
                models::QwenModelWeights weights,
@@ -112,11 +113,19 @@ public:
     return weights_;
   }
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
-      const noexcept {
+      const noexcept override {
     return *tokenizer_;
   }
-  [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept {
+  [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept override {
     return weights_.config;
+  }
+  [[nodiscard]] const models::QwenTensorRef& GetTokenEmbedding()
+      const noexcept override {
+    return weights_.token_embd;
+  }
+  [[nodiscard]] const models::QwenTensorRef& GetOutputHead()
+      const noexcept override {
+    return weights_.output;
   }
   [[nodiscard]] std::size_t GetWeightRegionCount() const noexcept {
     return weight_regions_.size();

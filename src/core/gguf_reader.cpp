@@ -807,6 +807,26 @@ std::vector<std::string_view> GgufReader::GetMetadataStringArray(
   return {};
 }
 
+std::vector<std::uint64_t> GgufReader::GetMetadataUintArray(
+    std::string_view key) const {
+  const auto* meta = FindMetadata(key);
+  if (meta != nullptr &&
+      std::holds_alternative<std::vector<std::uint64_t>>(meta->value)) {
+    return std::get<std::vector<std::uint64_t>>(meta->value);
+  }
+  return {};
+}
+
+std::vector<std::int64_t> GgufReader::GetMetadataIntArray(
+    std::string_view key) const {
+  const auto* meta = FindMetadata(key);
+  if (meta != nullptr &&
+      std::holds_alternative<std::vector<std::int64_t>>(meta->value)) {
+    return std::get<std::vector<std::int64_t>>(meta->value);
+  }
+  return {};
+}
+
 const GgufTensorInfo* GgufReader::FindTensor(
     std::string_view name) const noexcept {
   auto it = tensor_index_.find(name);
@@ -943,6 +963,55 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
     config.expert_shared_ff_length = *val;
   }
 
+  // 2b. Flint-specific geometry: MoE routing, the sliding window and the
+  // per-layer window/RoPE switches. Absent keys keep their zero defaults,
+  // which IsValidFlint() then judges.
+  if (config.architecture == "flint") {
+    // Every flint layer is a full-attention layer (F-B1). With the interval
+    // at 1, FullAttentionLayerCount() == block_count and SsmLayerCount() == 0,
+    // so KV sizing covers all layers and no SSM state is ever derived.
+    config.full_attention_interval = 1;
+    if (auto val = GetMetadataUint32(prefix + "expert_count")) {
+      config.expert_count = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "expert_used_count")) {
+      config.expert_used_count = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "expert_feed_forward_length")) {
+      config.expert_feed_forward_length = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "expert_shared_count")) {
+      config.expert_shared_count = *val;
+    }
+    if (auto val =
+            GetMetadataUint32(prefix + "expert_shared_feed_forward_length")) {
+      config.expert_shared_feed_forward_length = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "expert_gating_func")) {
+      config.expert_gating_func = *val;
+    }
+    if (auto val = GetMetadataFloat32(prefix + "expert_weights_scale")) {
+      config.expert_weights_scale = *val;
+    }
+    if (auto val = GetMetadataBool(prefix + "expert_weights_norm")) {
+      config.expert_weights_norm = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "leading_dense_block_count")) {
+      config.leading_dense_block_count = *val;
+    }
+    if (auto val = GetMetadataUint32(prefix + "attention.sliding_window")) {
+      config.sliding_window = *val;
+    }
+    for (const auto entry :
+         GetMetadataUintArray(prefix + "attention.sliding_window_pattern")) {
+      config.sliding_window_pattern.push_back(entry != 0);
+    }
+    for (const auto entry :
+         GetMetadataUintArray(prefix + "attention.rope_pattern")) {
+      config.rope_pattern.push_back(entry != 0);
+    }
+  }
+
   // 3. MTP speculative layers are included in qwen35.block_count but are not
   // part of the main autoregressive transformer stack.
   const auto embedded_mtp_layers =
@@ -982,8 +1051,28 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
     }
   }
 
-  // 6. Validate configuration against Qwen3.5/3.8 structural rules
-  if (!config.IsValidQwen()) {
+  // 6. Validate configuration against architecture-specific structural rules.
+  if (config.architecture == "flint") {
+    if (!config.IsValidFlint(error_msg)) {
+      return std::nullopt;
+    }
+    // Fail closed when the dense lead disagrees with the tensor inventory:
+    // routers live on the MoE layers only (layer >= leading_dense_block_count).
+    // A wrong count would silently load dense FFNs where experts are expected,
+    // or refuse routers the file actually carries.
+    for (std::uint32_t layer = 0; layer < config.num_layers; ++layer) {
+      const std::string name =
+          "blk." + std::to_string(layer) + ".ffn_gate_inp.weight";
+      if ((layer >= config.leading_dense_block_count) != HasTensor(name)) {
+        if (error_msg != nullptr) {
+          *error_msg = "flint.leading_dense_block_count=" +
+                       std::to_string(config.leading_dense_block_count) +
+                       " disagrees with the tensor inventory at " + name;
+        }
+        return std::nullopt;
+      }
+    }
+  } else if (!config.IsValidQwen()) {
     if (error_msg != nullptr) {
       *error_msg = "Model config failed Qwen structural validation (head_dim=" +
                    std::to_string(config.head_dim) +
