@@ -135,6 +135,9 @@ struct TextRunnerDescriptor {
   /// Core preset kept for existing extensions.
   sampling::TextModelPreset sampling_preset{
       sampling::TextModelPreset::kUnspecified};
+  /// Largest prompt step a lone request runs. Intermediate checkpoints sit on
+  /// its multiples so they never shorten a step; zero means unknown.
+  std::size_t prefill_step_tokens{0};
 };
 
 struct TextRunnerResourceClaim {
@@ -456,6 +459,15 @@ public:
   virtual void PrepareBatchExecution(TextRunnerState& state) const {
     (void)state;
   }
+  /// The next position at which the state will be decoded from, snapshotted
+  /// or shared. A runner whose draft reads a bounded window of target context
+  /// may omit that context for prompt positions the window will have left by
+  /// then. Applies to the next Prefill only.
+  virtual void SetDraftContextHorizon(TextRunnerState& state,
+                                      std::size_t position) const {
+    (void)state;
+    (void)position;
+  }
   [[nodiscard]] virtual TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const = 0;
@@ -562,6 +574,8 @@ struct TextSpeculativeConfig {
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
+  /// Rows per batched MTP prime slice; `0` selects the legacy serial prime.
+  std::uint32_t mtp_prime_chunk{1024};
   TextDFlashDraftPolicy dflash_policy{TextDFlashDraftPolicy::kAdaptive};
 };
 
