@@ -215,24 +215,47 @@ table = dict(config['tables']['multi-dflash2'], modes=['ar'], concurrency=[1],
 config['tables'] = {'multi-dflash2': table}
 json.dump(config, open(sys.argv[2], 'w'), indent=1)
 PY
+  # Only Q6, the variant production served and the GPU tests load, keeps the
+  # 128K depth: it is about 40% of a single-user table's time. The other
+  # variants stop at 64K; the comparison skips rows a night did not measure.
+  local f
+  for f in bench.json bench-mtp.json; do
+    python3 - "$c35/$f" "$out/short-$f" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for table in config['tables'].values():
+    if 'depths' in table:
+        table['depths'] = [depth for depth in table['depths'] if depth <= 65536]
+json.dump(config, open(sys.argv[2], 'w'), indent=1)
+PY
+  done
+  cfg35() { if [ "$1" = q6 ]; then echo "$c35/$2"; else echo "$out/short-$2"; fi; }
   local -A gguf=([q4]=$Q35_Q4 [q6]=$Q35_Q6 [q8]=$Q35_Q8 [q4km]=$Q35_Q4KM)
+  local measuring_again=
+  bench_failed() {
+    # Rows that fail when measured again keep their first value, which
+    # compare_bench.py still judges. Later repetitions use other prompts, and
+    # the repetition corpus can stop at EOS on them (Ornith, 2026-11-03).
+    if [ -n "$measuring_again" ]; then log "$1: a row failed when measured again; its first value stands"
+    else fail "$1"; fi
+  }
   mb35() {
     $py tools/bench/model-bench.py --model qwen3.6-35b-a3b --gufo "$head_gufo" --config "$2" \
       --artifacts-dir "$art/35b" --log-dir "$out/logs/bench" --gguf "$1=${gguf[$1]}" --draft "$Q35_DRAFT" \
-      run --target gufo --table "$3" "${@:4}" >> "$out/logs/bench.log" 2>&1 || fail "benchmark $3"
+      run --target gufo --table "$3" "${@:4}" >> "$out/logs/bench.log" 2>&1 || bench_failed "benchmark $3"
   }
   mbo() {
     $py tools/bench/model-bench.py --model ornith-1.5-122b --gufo "$head_gufo" --config "$1" \
       --artifacts-dir "$art/ornith" --log-dir "$out/logs/bench" --gguf "q4km=$ORNITH_GGUF" \
-      run --target gufo --table "$2" "${@:3}" >> "$out/logs/bench.log" 2>&1 || fail "benchmark Ornith $2"
+      run --target gufo --table "$2" "${@:3}" >> "$out/logs/bench.log" 2>&1 || bench_failed "benchmark Ornith $2"
   }
   cd "$src" || return
   for v in q4 q6 q8 q4km; do
     late "benchmarks from 35B $v" && return
     log "35B $v"
-    mb35 $v "$c35/bench.json" single-ar-$v
-    mb35 $v "$c35/bench.json" single-dflash2-$v
-    [ $v = q4km ] || mb35 $v "$c35/bench-mtp.json" single-mtp-$v
+    mb35 $v "$(cfg35 $v bench.json)" single-ar-$v
+    mb35 $v "$(cfg35 $v bench.json)" single-dflash2-$v
+    [ $v = q4km ] || mb35 $v "$(cfg35 $v bench-mtp.json)" single-mtp-$v
     mb35 $v "$out/bench-arhash.json" multi-dflash2-$v
     mb35 $v "$c35/bench.json" multi-ar-$v
     mb35 $v "$c35/bench.json" multi-dflash2-$v
@@ -256,6 +279,7 @@ PY
   # of one binary, so they are measured again as the mean of three.
   python3 "$src/tools/nightly/compare_bench.py" --set-aside "$out/bench-retry.txt" "${groups[@]}" > /dev/null
   local index config table reps
+  measuring_again=1
   while read -r index config table; do
     late "the second measurement of $table" && break
     log "measure $table again"
@@ -264,11 +288,12 @@ PY
     if [ "$config" = bench-arhash.json ]; then
       mb35 "${table##*-}" "$out/bench-arhash.json" "$table"
     elif [ "$index" = 0 ]; then
-      mb35 "${table##*-}" "$c35/$config" "$table" "${reps[@]}"
+      mb35 "${table##*-}" "$(cfg35 "${table##*-}" "$config")" "$table" "${reps[@]}"
     else
       mbo "$corn/$config" "$table" "${reps[@]}"
     fi
   done < "$out/bench-retry.txt"
+  measuring_again=
   python3 "$src/tools/nightly/compare_bench.py" "${groups[@]}" >> "$report" || fail "benchmark regressions"
 }
 
