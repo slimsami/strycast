@@ -14,10 +14,16 @@ are downloaded separately and are not part of the runtime package.
 | Qwen3-ASR 1.7B | BF16 safetensors; audio to text | [Usage](qwen3-asr/README.md) |
 | Qwen3-TTS 12Hz 1.7B | BF16 safetensors; text/reference audio to speech | [Voice modes](qwen3-tts/README.md) |
 | Qwen3.8 27B | Q4/Q8 GGUF; text/images | [Usage and modes](qwen3.8-27b/README.md) |
-| Qwen3.6 35B-A3B | UD-Q4_K_XL / UD-Q6_K_XL / UD-Q8_K_XL GGUF; text (MoE) | [Usage and modes](qwen3.6-35b-a3b/README.md) |
-| Ornith 1.5 122B | Q4_K_M GGUF; text and vision (MoE) | [Usage and modes](ornith-1.5-122b/README.md) |
 | Qwen3.8 Flash-Next | Sharded Q4 GGUF; text/images | [Usage and modes](qwen3.8-flash-next/README.md) |
 <!-- END GENERATED MODEL TABLE -->
+
+Strycast adds these models, served by the Qwen extension (the table above is
+generated from the extension manifests):
+
+| Model | Weights / supported inputs | Guide |
+| --- | --- | --- |
+| Qwen3.6 35B-A3B | UD-Q4_K_XL / UD-Q6_K_XL / UD-Q8_K_XL GGUF; text (MoE) | [Usage and modes](qwen3.6-35b-a3b/README.md) |
+| Ornith 1.5 122B | Q4_K_M GGUF; text and vision (MoE) | [Usage and modes](ornith-1.5-122b/README.md) |
 
 Each model folder contains:
 
