@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <gufo/ext/registry.hpp>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -24,7 +25,6 @@
 #include <utility>
 #include <vector>
 
-#include <gufo/ext/registry.hpp>
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"

@@ -247,10 +247,10 @@ struct SpeculativeVerifier::PreparedStep {
 };
 
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
-    std::span<const sampling::TokenId> current_sequence,
-    std::uint32_t cur_pos, sampling::TokenId current_token,
-    sampling::TokenId eos_id, std::uint32_t max_emitted_tokens,
-    sampling::SamplerState& sampler, std::uint32_t max_draft_tokens) {
+    std::span<const sampling::TokenId> current_sequence, std::uint32_t cur_pos,
+    sampling::TokenId current_token, sampling::TokenId eos_id,
+    std::uint32_t max_emitted_tokens, sampling::SamplerState& sampler,
+    std::uint32_t max_draft_tokens) {
   sampler.config().Validate();
   if (!use_batched_verification_ &&
       sampler.config().can_use_unmodified_argmax()) {
