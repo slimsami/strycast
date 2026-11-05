@@ -83,3 +83,12 @@ set_property(
     ${CMAKE_CURRENT_SOURCE_DIR}/prefill_quant_wave64.hip
   TARGET_DIRECTORY gufo_qwen_kernels
   APPEND PROPERTY COMPILE_OPTIONS ${GUFO_CLANG_OPTION}-fno-slp-vectorize)
+# The 35B's routed F16 expert GEMMs are a copy of Flash-Next's, and keep the
+# options of its kernel library: the 35B's committed outputs were measured with
+# them, and plain -O2 changes the routed arithmetic.
+set_property(
+  SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/routed_f16.hip
+  TARGET_DIRECTORY gufo_qwen_kernels
+  APPEND PROPERTY COMPILE_OPTIONS
+    ${GUFO_CLANG_OPTION}-O3 ${GUFO_CLANG_OPTION}-ffast-math
+    ${GUFO_CLANG_OPTION}-fno-finite-math-only)
