@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
@@ -20,6 +22,7 @@
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/deepseek_v4_flash/runner.hpp"
 
 namespace {
 
@@ -31,6 +34,22 @@ void Expect(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+// InferenceBackend loads a resident model through its extension runner.
+bool LoadBackend(gufo::server::InferenceBackend& backend,
+                 std::shared_ptr<Model> model, std::string* error,
+                 std::uint32_t max_context, std::size_t session_count = 1,
+                 gufo::server::TextPrefillPolicy prefill_policy = {},
+                 gufo::server::TextSchedulerPolicy scheduler_policy = {},
+                 gufo::server::TextSpeculativeConfig speculative_config = {},
+                 gufo::server::TextDiskCacheConfig disk_cache_config = {}) {
+  auto runner = gufo::models::deepseek_v4_flash::CreateDeepSeekTextRunner(
+      std::move(model), max_context, speculative_config,
+      disk_cache_config.model_artifact_fingerprint,
+      disk_cache_config.draft_model_artifact_fingerprint);
+  return backend.load(std::move(runner), error, session_count, prefill_policy,
+                      scheduler_policy, disk_cache_config);
 }
 
 std::vector<gufo::tokenization::TokenId> GenerateDirect(
@@ -291,7 +310,7 @@ void CheckExecutionModes(const std::shared_ptr<Model>& model) {
       saved_ar && saved_spec && saved_ar->SizeBytes() < saved_spec->SizeBytes(),
       "AR snapshot includes predictor state");
   gufo::server::InferenceBackend backend;
-  Expect(backend.load(model, &error, 512, 1), error);
+  Expect(LoadBackend(backend, model, &error, 512, 1), error);
   const auto actual = backend.complete(text, 8, 0.0F);
   Expect(actual.draft_tokens == 0 &&
              actual.tokens == GenerateDirect(model, prompt, 8),
@@ -321,7 +340,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
                              "", ""}});
   {
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 262144, 1, {}, {}, speculative), error);
+    Expect(LoadBackend(backend, model, &error, 262144, 1, {}, {}, speculative),
+           error);
     const auto cold = backend.chat(prompt, 32, 0.0F);
     const auto warm = backend.chat(prompt, 32, 0.0F);
     Expect(cold.draft_tokens > 0 && warm.cache_hit && warm.prefill_tokens == 0,
@@ -344,7 +364,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
     const auto direct_prompt =
         model->EncodeChat(direct_messages, ResolveDeepSeekChatOptions({}));
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 4096, 1, {}, {}, speculative), error);
+    Expect(LoadBackend(backend, model, &error, 4096, 1, {}, {}, speculative),
+           error);
     const auto greedy = backend.chat(prompt, 32, 0.0F);
     std::size_t sampled_drafts = 0;
     for (const auto& sampling : {
@@ -389,7 +410,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
                                                .repeat_penalty = 1.1F};
   for (const std::size_t concurrency : {2U, 4U}) {
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 4096, concurrency, {}, {}, speculative),
+    Expect(LoadBackend(backend, model, &error, 4096, concurrency, {}, {},
+                       speculative),
            error);
     std::vector<std::shared_ptr<TextGenerationBackend::GenerationRequest>>
         pending;
@@ -417,8 +439,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
   }
   {
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 4096, 2, {.decode_active_tokens = 32},
-                        {}, speculative),
+    Expect(LoadBackend(backend, model, &error, 4096, 2,
+                       {.decode_active_tokens = 32}, {}, speculative),
            error);
     auto active = backend.start_chat(prompt, 64, 0.0F, {}, true);
     std::shared_ptr<TextGenerationBackend::GenerationRequest> late;
@@ -441,7 +463,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
 
   {
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 64, 2, {}, {}, speculative), error);
+    Expect(LoadBackend(backend, model, &error, 64, 2, {}, {}, speculative),
+           error);
     auto greedy = backend.start_chat(prompt, 128, 0.0F, {}, true);
     auto sampling = backend.start_chat(prompt, 128, sampled, {}, true);
     for (const auto& result : {greedy->Wait(), sampling->Wait()}) {
@@ -471,8 +494,9 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
     if (run == 2)
       disk.draft_model_artifact_fingerprint = std::string(64, 'c');
     InferenceBackend backend;
-    Expect(backend.load(model, &error, 4096, 1, {}, {}, speculative, disk),
-           error);
+    Expect(
+        LoadBackend(backend, model, &error, 4096, 1, {}, {}, speculative, disk),
+        error);
     const auto result = backend.chat(prompt, 8, sampled);
     Expect(result.cache_disk_hit == (run == 1),
            "DSpark disk reuse requires the matching support artifact identity");
@@ -525,7 +549,7 @@ int main(int argc, char** argv) {
       Expect(model != nullptr, error);
 
       gufo::server::InferenceBackend backend;
-      Expect(backend.load(model, &error, 512, 2), error);
+      Expect(LoadBackend(backend, model, &error, 512, 2), error);
       Expect(backend.model_id() == model->ModelName(), "HTTP model identifier");
 
       const std::string raw_prompt = "The capital of France is";
