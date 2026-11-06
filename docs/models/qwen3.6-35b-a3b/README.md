@@ -153,6 +153,30 @@ decodes much faster than MTP on repetitive text, the two are close on mixed
 text, and MTP prefills slightly faster; see
 [Benchmarks](BENCHMARKS.md#multiple-users-dflash2).
 
+### 8-bit KV cache
+
+`gufo serve llm --kv-cache q8_0` stores the attention KV cache in the ggml
+Q8_0 layout: per position and KV head, 256 int8 values and 8 FP16 scales, one
+per block of 32, so 272 bytes instead of 512. The writers quantize as rows are
+stored, and the decode, verify and prefill attention kernels read the int8
+rows directly, dequantizing to FP16 as they stage keys and values; the
+attention arithmetic is otherwise the FP16 path's. The default stays `f16`,
+and other models refuse the option. Only this model's 10 attention layers
+hold KV, so the saving is 2.34 GiB per session at context 262144 (0.59 GiB at
+65536). Prompt-cache entries record the format, so FP16 and Q8 entries are
+never mixed. MTP and DFlash2 keep their own FP16 draft caches, and greedy
+speculative output stays bit-exact against AR in Q8 mode, since verify rows
+reproduce single-token decode over the same Q8 rows. CUDA-graph decode is not
+used in Q8 mode.
+
+On Q4_K_M at context 262144 (November 6, 2026), Q8 and FP16 KV scored the
+same within noise: 5-shot MMLU 81.84% vs 81.32% (969 questions), needle
+retrieval 72/72 for both at 24K-100K tokens, aggregation 38/120 vs 40/120. After
+code prompts of 8K, 32K and 128K tokens, the first generated token had the same
+argmax in 27 of 28 cases, with a mean KL divergence of 0.05-0.06 nats over the
+top 20 tokens, at every depth; those first tokens are uncertain ones (entropy
+about 1.6 nats).
+
 Thinking/template controls and HTTP sampling defaults are described in
 [the server guide](../../SERVER.md#reasoning-controls).
 
