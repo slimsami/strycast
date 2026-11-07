@@ -144,21 +144,18 @@ constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 // kQ8 reads the canonical 8-bit cache (kv_q8.hpp): k_cache_f16 and
 // v_cache_f16 then point at one layer of the 8-bit planes. Each thread loads
 // 16 int8 values and their scale and expands them to FP16 at the LDS stage.
+// The body is shared by two kernels so that the FP16 kernels keep their
+// names, which the kernel scratch allowances are keyed on.
 template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads,
-         std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false,
-         bool kQ8 = false>
-// LLVM 24 otherwise uses 241 VGPRs for packed V, crossing the six-wave
-// allocation boundary. Keep six waves resident without changing the tiling.
-__launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
-    void WmmaCausalAttention(const float* __restrict__ q,
-                             const float* __restrict__ gate,
-                             const __half* __restrict__ k_cache_f16,
-                             const __half* __restrict__ v_cache_f16,
-                             float* __restrict__ out_context,
-                             std::uint32_t start_pos, std::size_t batch_size,
-                             float* __restrict__ lse_out,
-                             std::uint32_t key_begin,
-                             std::uint32_t first_query) {
+         std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor,
+         bool kQ8>
+__device__ __forceinline__ void WmmaCausalAttentionBody(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const __half* __restrict__ k_cache_f16,
+    const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
+    std::uint32_t start_pos, std::size_t batch_size,
+    float* __restrict__ lse_out, std::uint32_t key_begin,
+    std::uint32_t first_query) {
   constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
   constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
   constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
@@ -273,28 +270,28 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   const auto* k_base = k_cache_f16 + head_offset;
 
   // 8-bit rows: thread tid stages 16 dimensions of key tid / 16, and owns 16
-  // dimensions of key v_key for V as above.
-  const std::size_t q8_stride =
+  // dimensions of key v_key for V as above. Only the kQ8 branches use these.
+  constexpr std::size_t kQ8Stride =
       static_cast<std::size_t>(kKvHeads) * kv_q8::kRowBytes;
-  const auto* k_rows = reinterpret_cast<const std::uint8_t*>(k_cache_f16) +
-                       static_cast<std::size_t>(kv_head) * kv_q8::kRowBytes;
-  const auto* v_rows = reinterpret_cast<const std::uint8_t*>(v_cache_f16) +
-                       static_cast<std::size_t>(kv_head) * kv_q8::kRowBytes;
-  const std::uint32_t q8_key = tid / 16u;
-  const std::uint32_t q8_dim = (tid % 16u) * 16u;
+  const auto q8_row = [&](const __half* plane, std::uint32_t key_position) {
+    return reinterpret_cast<const std::uint8_t*>(plane) +
+           (static_cast<std::size_t>(key_position) * kQ8Stride) +
+           (static_cast<std::size_t>(kv_head) * kv_q8::kRowBytes);
+  };
 
-  using ValueFragment = std::conditional_t<
-      kHeadMajor, v16h, std::conditional_t<kQ8, kv_q8::Slice16, uint4>>;
+  using ValueFragment =
+      std::conditional_t<kHeadMajor, v16h,
+                         std::conditional_t<kQ8, kv_q8::Slice16, uint4>>;
   constexpr std::uint32_t kValueFragments = kHeadMajor ? 2 : (kQ8 ? 1 : kVRegs);
   using KeyFragment = std::conditional_t<kQ8, kv_q8::Slice16, uint4>;
   constexpr std::uint32_t kKeyFragments = kQ8 ? 1 : kKRegs;
   const auto load_v = [&](std::uint32_t key_start, ValueFragment* dst) {
     if constexpr (kQ8) {
       const std::uint32_t key_position = key_start + v_key;
-      dst[0] = key_position < context_end
-                   ? kv_q8::LoadSlice16(v_rows + key_position * q8_stride,
-                                        v_slice)
-                   : kv_q8::Slice16{make_uint4(0u, 0u, 0u, 0u), 0.0F};
+      dst[0] =
+          key_position < context_end
+              ? kv_q8::LoadSlice16(q8_row(v_cache_f16, key_position), v_slice)
+              : kv_q8::Slice16{make_uint4(0u, 0u, 0u, 0u), 0.0F};
     } else if constexpr (kHeadMajor) {
       // Each wave consumes two dimension tiles. The temporary value layout
       // supplies their WMMA fragments directly, avoiding a repeated LDS
@@ -324,10 +321,10 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   // Coalesced: a wave reads one key row's 512 contiguous bytes.
   const auto load_k = [&](std::uint32_t key_start, KeyFragment* dst) {
     if constexpr (kQ8) {
-      const std::uint32_t key_position = key_start + q8_key;
+      const std::uint32_t key_position = key_start + (tid / 16u);
       dst[0] = key_position < context_end
-                   ? kv_q8::LoadSlice16(k_rows + key_position * q8_stride,
-                                        q8_dim)
+                   ? kv_q8::LoadSlice16(q8_row(k_cache_f16, key_position),
+                                        (tid % 16u) * 16u)
                    : kv_q8::Slice16{make_uint4(0u, 0u, 0u, 0u), 0.0F};
     } else {
 #pragma unroll
@@ -360,7 +357,7 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
       uint4 halves[2];
       kv_q8::Dequantize16(k_cur[0], halves);
       auto* dst = reinterpret_cast<uint4*>(
-          &kv_lds[(q8_key * kWmmaKStride) + q8_dim]);
+          &kv_lds[((tid / 16u) * kWmmaKStride) + ((tid % 16u) * 16u)]);
       dst[0] = halves[0];
       dst[1] = halves[1];
     } else {
@@ -484,18 +481,22 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
     // prefer -- each lane taking 8 contiguous dims of one key -- puts all 32
     // lanes on rows kVtStride halves apart, which is one bank, and costs a
     // 32-way conflict on every write.
-    if constexpr (!kHeadMajor) {
+    if constexpr (kQ8) {
       uint4 v_halves[kVRegs];
-      if constexpr (kQ8) {
-        kv_q8::Dequantize16(v_cur[0], v_halves);
-      } else {
-#pragma unroll
-        for (std::uint32_t j = 0; j < kVRegs; ++j)
-          v_halves[j] = v_cur[j];
-      }
+      kv_q8::Dequantize16(v_cur[0], v_halves);
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
         const auto* packed = reinterpret_cast<const __half*>(&v_halves[j]);
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
+        }
+      }
+      __syncthreads();
+    } else if constexpr (!kHeadMajor) {
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
 #pragma unroll
         for (std::uint32_t i = 0; i < 8; ++i) {
           kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
@@ -656,6 +657,45 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   }
 }
 
+template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads,
+         std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false>
+// LLVM 24 otherwise uses 241 VGPRs for packed V, crossing the six-wave
+// allocation boundary. Keep six waves resident without changing the tiling.
+__launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
+    void WmmaCausalAttention(const float* __restrict__ q,
+                             const float* __restrict__ gate,
+                             const __half* __restrict__ k_cache_f16,
+                             const __half* __restrict__ v_cache_f16,
+                             float* __restrict__ out_context,
+                             std::uint32_t start_pos, std::size_t batch_size,
+                             float* __restrict__ lse_out,
+                             std::uint32_t key_begin,
+                             std::uint32_t first_query) {
+  WmmaCausalAttentionBody<kQueryHeads, kKvHeads, kQueryRows, kKeys, kHeadMajor,
+                          false>(q, gate, k_cache_f16, v_cache_f16, out_context,
+                                 start_pos, batch_size, lse_out, key_begin,
+                                 first_query);
+}
+
+// The same attention over the 8-bit cache, read in place.
+template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads,
+         std::uint32_t kQueryRows, std::uint32_t kKeys>
+__launch_bounds__(256, 2) __global__
+    void WmmaCausalAttentionQ8(const float* __restrict__ q,
+                               const float* __restrict__ gate,
+                               const __half* __restrict__ k_cache_f16,
+                               const __half* __restrict__ v_cache_f16,
+                               float* __restrict__ out_context,
+                               std::uint32_t start_pos, std::size_t batch_size,
+                               float* __restrict__ lse_out,
+                               std::uint32_t key_begin,
+                               std::uint32_t first_query) {
+  WmmaCausalAttentionBody<kQueryHeads, kKvHeads, kQueryRows, kKeys, false,
+                          true>(q, gate, k_cache_f16, v_cache_f16, out_context,
+                                start_pos, batch_size, lse_out, key_begin,
+                                first_query);
+}
+
 // Expands 8 values of an 8-bit KV row into FP16 with the same arithmetic as
 // kv_q8::Dequantize16, so packed and in-place reads see identical keys.
 __device__ __forceinline__ uint4 Dequantize8(const std::uint8_t* row,
@@ -777,9 +817,8 @@ void LaunchWmmaAttentionShape(
     throw std::invalid_argument(
         "8-bit KV prefill attention needs the cache already written");
   // 8-bit rows of this layer; the layer_k/layer_v offsets above assume FP16.
-  const std::size_t q8_layer_bytes =
-      static_cast<std::size_t>(layer_idx) *
-      kv_q8::LayerBytes(max_context, kKvHeads);
+  const std::size_t q8_layer_bytes = static_cast<std::size_t>(layer_idx) *
+                                     kv_q8::LayerBytes(max_context, kKvHeads);
   const auto* q8_k =
       static_cast<const std::uint8_t*>(k_cache_f16) + q8_layer_bytes;
   const auto* q8_v =
@@ -827,11 +866,11 @@ void LaunchWmmaAttentionShape(
     return;
   }
   if (kv_q8) {
-    WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys,
-                        false, true><<<grid, block_size, 0, stream>>>(
-        q, gate, reinterpret_cast<const __half*>(q8_k),
-        reinterpret_cast<const __half*>(q8_v), out_context, start_pos,
-        batch_size, lse_out, key_begin, first_query);
+    WmmaCausalAttentionQ8<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys>
+        <<<grid, block_size, 0, stream>>>(
+            q, gate, reinterpret_cast<const __half*>(q8_k),
+            reinterpret_cast<const __half*>(q8_v), out_context, start_pos,
+            batch_size, lse_out, key_begin, first_query);
     return;
   }
   WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys>
