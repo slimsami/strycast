@@ -74,9 +74,9 @@ void Check(hip::QwenKvCacheStorage kv, bool bf16) {
 }  // namespace
 int main() {
   try {
-    for (auto kv : {hip::QwenKvCacheStorage::kFp32,
-                    hip::QwenKvCacheStorage::kFp16,
-                    hip::QwenKvCacheStorage::kQ8})
+    for (auto kv :
+         {hip::QwenKvCacheStorage::kFp32, hip::QwenKvCacheStorage::kFp16,
+          hip::QwenKvCacheStorage::kQ8})
       for (bool bf16 : {false, true})
         Check(kv, bf16);
     std::cout << "Qwen continuation geometry: PASS\n";

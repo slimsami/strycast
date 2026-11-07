@@ -177,6 +177,17 @@ argmax in 27 of 28 cases, with a mean KL divergence of 0.05-0.06 nats over the
 top 20 tokens, at every depth; those first tokens are uncertain ones (entropy
 about 1.6 nats).
 
+Decode reads half the KV bytes, so it gains with depth; prefill stores and
+packs the same rows and runs at FP16 speed. Q4_K_M, one request (tok/s, f16 →
+q8_0):
+
+| Depth | Prefill | AR decode | DFlash2 decode, repetitive | MTP decode, repetitive |
+| --- | --- | --- | --- | --- |
+| 0 | 3262 → 3268 | 74.8 → 74.6 | 256 → 256 | 106 → 106 |
+| 8K | 2815 → 2811 | 70.5 → 72.2 | 242 → 242 | 101 → 101 |
+| 32K | 1919 → 1926 | 61.1 → 64.3 | 204 → 213 | 87.3 → 89.0 |
+| 128K | 877 → 879 | 40.1 → 44.4 | 135 → 145 | 55.4 → 57.9 |
+
 Thinking/template controls and HTTP sampling defaults are described in
 [the server guide](../../SERVER.md#reasoning-controls).
 

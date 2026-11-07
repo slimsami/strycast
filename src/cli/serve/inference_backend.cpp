@@ -228,8 +228,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   if (!kv_cache.empty() && kv_cache != "f16" && provider->id != "qwen27-q4") {
-    SetError(error, "--kv-cache " + kv_cache + " is not supported by " +
-                        provider->id);
+    SetError(error,
+             "--kv-cache " + kv_cache + " is not supported by " + provider->id);
     return false;
   }
   ext::TextRunnerOptions options{

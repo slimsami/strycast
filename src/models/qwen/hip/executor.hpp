@@ -432,9 +432,10 @@ public:
   [[nodiscard]] std::size_t GetAttentionKvPlaneBytes() const noexcept {
     return static_cast<std::size_t>(config_.FullAttentionLayerCount()) *
            max_context_ *
-           QwenKvRowBytes(policy_.kv_cache_storage,
-                          static_cast<std::size_t>(config_.num_key_value_heads) *
-                              config_.head_dim);
+           QwenKvRowBytes(
+               policy_.kv_cache_storage,
+               static_cast<std::size_t>(config_.num_key_value_heads) *
+                   config_.head_dim);
   }
   /// V plane of the token-major cache: it follows the K plane at
   /// d_attention_kv_f16. nullptr when the FP32 reference cache is used.

@@ -54,7 +54,7 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
   const auto kv_row = hip::QwenKvRowBytes(
       policy.kv_cache_storage, Product({c.num_key_value_heads, c.head_dim}));
   // Component versions: 1 FP16, 2 FP32, 3 8-bit.
-  const std::uint32_t kv_version = policy.UsesFp16AttentionKv()  ? 1U
+  const std::uint32_t kv_version = policy.UsesFp16AttentionKv() ? 1U
                                    : policy.UsesQ8AttentionKv() ? 3U
                                                                 : 2U;
   const auto key_width = Product({2, c.ssm_group_count, c.ssm_state_size});

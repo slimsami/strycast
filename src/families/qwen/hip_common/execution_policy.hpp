@@ -16,8 +16,8 @@ enum class QwenKvCacheStorage : std::uint8_t {
 
 /// Bytes that `values` consecutive KV values occupy: one FP32 head row, or
 /// one position of a token-major FP16 or 8-bit plane (whole 32-value blocks).
-[[nodiscard]] constexpr std::size_t QwenKvRowBytes(QwenKvCacheStorage storage,
-                                                   std::size_t values) noexcept {
+[[nodiscard]] constexpr std::size_t QwenKvRowBytes(
+    QwenKvCacheStorage storage, std::size_t values) noexcept {
   switch (storage) {
     case QwenKvCacheStorage::kFp32:
       return values * sizeof(float);

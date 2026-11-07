@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -188,7 +189,8 @@ void TestWriters() {
   const std::size_t first = row_at(kStart, 0);
   const std::size_t last = row_at(kStart + kBatch, 0);
   for (std::size_t i = 0; i < cache_bytes; ++i)
-    if ((i < first || i >= last) && (got_k[i] != fill[i] || got_v[i] != fill[i]))
+    if ((i < first || i >= last) &&
+        (got_k[i] != fill[i] || got_v[i] != fill[i]))
       Fail("the batched writer touched bytes outside its rows");
 
   // Single-token fused writer, one position at a time.
@@ -196,8 +198,8 @@ void TestWriters() {
   gufo::test::DeviceBuffer<std::uint32_t> d_pos(1);
   for (std::uint32_t b = 0; b < kBatch; ++b) {
     const std::uint32_t pos = kStart + b;
-    HIP_CHECK(hipMemcpy(d_pos.data(), &pos, sizeof(pos),
-                        hipMemcpyHostToDevice));
+    HIP_CHECK(
+        hipMemcpy(d_pos.data(), &pos, sizeof(pos), hipMemcpyHostToDevice));
     gufo::hip::LaunchFusedQKNormRoPEKvWrite(
         d_q.data() + b * kAttnWidth, d_k.data() + b * kKvWidth,
         d_v.data() + b * kKvWidth, d_qw.data(), d_kw.data(), d_q_out.data(),
@@ -359,7 +361,10 @@ void TestDecode(std::uint32_t start_pos, std::uint32_t rows) {
             << ", rows identical alone\n";
 }
 
-void TestPrefill(std::uint32_t start_pos, std::uint32_t rows) {
+// packed_heads > 0 gives the launcher room to pack that many KV heads into
+// FP16 head-major scratch, the route of chunks of 1024 rows or more.
+void TestPrefill(std::uint32_t start_pos, std::uint32_t rows,
+                 std::uint32_t packed_heads = 0) {
   Rng rng(start_pos * 17U + rows + 3U);
   const auto cache = MakeCache(start_pos + rows + 16, rng);
   std::vector<float> q(rows * kAttnWidth), gate(rows * kAttnWidth);
@@ -370,20 +375,30 @@ void TestPrefill(std::uint32_t start_pos, std::uint32_t rows) {
   auto d_k = Upload(cache.k), d_v = Upload(cache.v);
   const auto d_q = Upload(q), d_gate = Upload(gate);
   gufo::test::DeviceBuffer<float> d_out(rows * kAttnWidth);
+  // One head's padded FP16 keys or values, in floats.
+  const std::size_t head_floats =
+      ((start_pos + rows + 15U) & ~15U) * kHeadDim / 2;
+  gufo::test::DeviceBuffer<float> d_packed_k(
+      std::max<std::size_t>(packed_heads * head_floats, 1)),
+      d_packed_v(std::max<std::size_t>(packed_heads * head_floats, 1));
+  const std::span<float> packed_k{d_packed_k.data(),
+                                  packed_heads * head_floats};
+  const std::span<float> packed_v{d_packed_v.data(),
+                                  packed_heads * head_floats};
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q.data(), nullptr, nullptr, d_gate.data(), nullptr, nullptr,
           d_k.data(), d_v.data(), d_out.data(), 1, start_pos, rows,
           cache.context, kHeads, kKvHeads, kHeadDim, nullptr, nullptr, 0,
-          /*skip_kv_write=*/true, {}, {}, 0, /*kv_q8=*/true))
+          /*skip_kv_write=*/true, packed_k, packed_v, 0, /*kv_q8=*/true))
     Fail("8-bit prefill attention rejected the 35B shape");
   const auto got = Download(d_out, rows * kAttnWidth);
   double max_error = 0.0, magnitude = 0.0;
   Reference(cache, q, gate, start_pos, rows, got, &max_error, &magnitude);
   if (!(max_error <= 4e-3 * std::max(magnitude, 1e-3)))
     Fail("8-bit prefill attention is far from the reference");
-  std::cout << "8-bit prefill attention start " << start_pos << " rows "
-            << rows << ": max error " << max_error << " of " << magnitude
-            << '\n';
+  std::cout << "8-bit prefill attention start " << start_pos << " rows " << rows
+            << " packed heads " << packed_heads << ": max error " << max_error
+            << " of " << magnitude << '\n';
 }
 
 }  // namespace
@@ -408,6 +423,9 @@ int main() {
   TestPrefill(0, 33);
   TestPrefill(300, 70);
   TestPrefill(2000, 64);
+  // Packed into FP16 scratch: all heads at once, then one head at a time.
+  TestPrefill(0, 1024, kKvHeads);
+  TestPrefill(1000, 1024, 1);
   std::cout << "Qwen 8-bit KV cache ops test passed on gfx1151.\n";
 #endif
   return 0;

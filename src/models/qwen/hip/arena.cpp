@@ -603,8 +603,9 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   const bool token_major = policy_.UsesTokenMajorAttentionKv();
   // One copied row: a whole position (token-major) or one FP32 head.
   const std::size_t kv_row_bytes =
-      token_major ? QwenKvRowBytes(policy_.kv_cache_storage, snapshot->kv_width_)
-                  : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
+      token_major
+          ? QwenKvRowBytes(policy_.kv_cache_storage, snapshot->kv_width_)
+          : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
   const std::uint32_t kv_rows =
       snapshot->attention_layers_ *
       (token_major ? 1U : config_.num_key_value_heads);
@@ -691,8 +692,9 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   if (snapshot.kv_elements_per_plane_ != 0) {
     const bool token_major = policy_.UsesTokenMajorAttentionKv();
     const auto row_bytes =
-        token_major ? QwenKvRowBytes(policy_.kv_cache_storage, kv_width)
-                    : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
+        token_major
+            ? QwenKvRowBytes(policy_.kv_cache_storage, kv_width)
+            : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
     const auto rows =
         attention_layers * (token_major ? 1U : config_.num_key_value_heads);
     const auto source_pitch =
@@ -757,8 +759,9 @@ void QwenGpuArena::RestoreCompactSnapshot(
   if (layout.live_kv_bytes_per_plane != 0) {
     const bool token_major = policy_.UsesTokenMajorAttentionKv();
     const auto row_bytes =
-        token_major ? QwenKvRowBytes(policy_.kv_cache_storage, kv_width)
-                    : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
+        token_major
+            ? QwenKvRowBytes(policy_.kv_cache_storage, kv_width)
+            : QwenKvRowBytes(QwenKvCacheStorage::kFp32, config_.head_dim);
     const auto rows =
         attention_layers * (token_major ? 1U : config_.num_key_value_heads);
     const std::size_t destination_pitch =

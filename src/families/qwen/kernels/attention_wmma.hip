@@ -656,10 +656,32 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   }
 }
 
+// Expands 8 values of an 8-bit KV row into FP16 with the same arithmetic as
+// kv_q8::Dequantize16, so packed and in-place reads see identical keys.
+__device__ __forceinline__ uint4 Dequantize8(const std::uint8_t* row,
+                                             std::uint32_t dim) {
+  union {
+    uint2 u;
+    std::int8_t b[8];
+  } src;
+  union {
+    uint4 u;
+    __half h[8];
+  } dst;
+  src.u = *reinterpret_cast<const uint2*>(row + dim);
+  const float d = __half2float(reinterpret_cast<const __half*>(
+      row + kv_q8::kScaleOffset)[dim / kv_q8::kBlock]);
+#pragma unroll
+  for (std::uint32_t i = 0; i < 8; ++i)
+    dst.h[i] = __float2half_rn(static_cast<float>(src.b[i]) * d);
+  return dst.u;
+}
+
 // FFN scratch is idle during attention. Keep K head-major and transpose each
 // 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
-template<std::uint32_t kKvHeads>
-__global__ void PackAttentionHeads(const __half* keys, const __half* values,
+// kQ8 reads 8-bit rows (kv_q8.hpp) and writes the same FP16 layout.
+template<std::uint32_t kKvHeads, bool kQ8 = false>
+__global__ void PackAttentionHeads(const void* keys, const void* values,
                                    __half* packed_keys, __half* packed_values,
                                    std::uint32_t length) {
   __shared__ __half tile[16][kHeadDim + 8];
@@ -670,15 +692,24 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
     const std::uint32_t dim = (i % (kHeadDim / 8)) * 8;
     uint4 value = make_uint4(0, 0, 0, 0);
     if (base + key < length) {
-      const auto src =
-          (static_cast<std::size_t>(base + key) * kKvHeads + head) * kHeadDim +
-          dim;
+      const auto row = static_cast<std::size_t>(base + key) * kKvHeads + head;
       const auto dst =
           (static_cast<std::size_t>(head) * length + base + key) * kHeadDim +
           dim;
-      *reinterpret_cast<uint4*>(packed_keys + dst) =
-          *reinterpret_cast<const uint4*>(keys + src);
-      value = *reinterpret_cast<const uint4*>(values + src);
+      if constexpr (kQ8) {
+        const auto offset = row * kv_q8::kRowBytes;
+        *reinterpret_cast<uint4*>(packed_keys + dst) =
+            Dequantize8(static_cast<const std::uint8_t*>(keys) + offset, dim);
+        value =
+            Dequantize8(static_cast<const std::uint8_t*>(values) + offset, dim);
+      } else {
+        const auto src = row * kHeadDim + dim;
+        *reinterpret_cast<uint4*>(packed_keys + dst) =
+            *reinterpret_cast<const uint4*>(static_cast<const __half*>(keys) +
+                                            src);
+        value = *reinterpret_cast<const uint4*>(
+            static_cast<const __half*>(values) + src);
+      }
     }
     *reinterpret_cast<uint4*>(&tile[key][dim]) = value;
   }
@@ -742,23 +773,17 @@ void LaunchWmmaAttentionShape(
       static_cast<unsigned int>(
           (batch_size - first_query + kWmmaQueryRows - 1) / kWmmaQueryRows),
       kKvHeads * (kGqa / kWmmaHeads));
-  if (kv_q8) {
-    if (!skip_kv_write)
-      throw std::invalid_argument(
-          "8-bit KV prefill attention needs the cache already written");
-    const std::size_t layer_bytes =
-        static_cast<std::size_t>(layer_idx) *
-        kv_q8::LayerBytes(max_context, kKvHeads);
-    WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys,
-                        false, true><<<grid, block_size, 0, stream>>>(
-        q, gate,
-        reinterpret_cast<const __half*>(
-            static_cast<const std::uint8_t*>(k_cache_f16) + layer_bytes),
-        reinterpret_cast<const __half*>(
-            static_cast<const std::uint8_t*>(v_cache_f16) + layer_bytes),
-        out_context, start_pos, batch_size, lse_out, key_begin, first_query);
-    return;
-  }
+  if (kv_q8 && !skip_kv_write)
+    throw std::invalid_argument(
+        "8-bit KV prefill attention needs the cache already written");
+  // 8-bit rows of this layer; the layer_k/layer_v offsets above assume FP16.
+  const std::size_t q8_layer_bytes =
+      static_cast<std::size_t>(layer_idx) *
+      kv_q8::LayerBytes(max_context, kKvHeads);
+  const auto* q8_k =
+      static_cast<const std::uint8_t*>(k_cache_f16) + q8_layer_bytes;
+  const auto* q8_v =
+      static_cast<const std::uint8_t*>(v_cache_f16) + q8_layer_bytes;
   const auto length = start_pos + static_cast<std::uint32_t>(batch_size);
   const std::size_t key_head_bytes =
       static_cast<std::size_t>(length) * kHeadDim * sizeof(__half);
@@ -780,10 +805,17 @@ void LaunchWmmaAttentionShape(
       const auto heads = std::min(heads_per_group, kKvHeads - first);
       const std::size_t query_offset =
           static_cast<std::size_t>(first) * kGqa * kHeadDim;
-      PackAttentionHeads<kKvHeads>
-          <<<dim3(heads, (length + 15u) / 16u), block_size, 0, stream>>>(
-              layer_k + first * kHeadDim, layer_v + first * kHeadDim, packed_k,
-              packed_v, length);
+      const dim3 pack_grid(heads, (length + 15u) / 16u);
+      if (kv_q8) {
+        PackAttentionHeads<kKvHeads, true>
+            <<<pack_grid, block_size, 0, stream>>>(
+                q8_k + first * kv_q8::kRowBytes,
+                q8_v + first * kv_q8::kRowBytes, packed_k, packed_v, length);
+      } else {
+        PackAttentionHeads<kKvHeads><<<pack_grid, block_size, 0, stream>>>(
+            layer_k + first * kHeadDim, layer_v + first * kHeadDim, packed_k,
+            packed_v, length);
+      }
       const dim3 group_grid(grid.x, heads * (kGqa / kWmmaHeads));
       WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys,
                           true><<<group_grid, block_size, 0, stream>>>(
@@ -792,6 +824,14 @@ void LaunchWmmaAttentionShape(
           lse_out ? lse_out + first * kGqa * batch_size : nullptr, key_begin,
           first_query);
     }
+    return;
+  }
+  if (kv_q8) {
+    WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys,
+                        false, true><<<grid, block_size, 0, stream>>>(
+        q, gate, reinterpret_cast<const __half*>(q8_k),
+        reinterpret_cast<const __half*>(q8_v), out_context, start_pos,
+        batch_size, lse_out, key_begin, first_query);
     return;
   }
   WmmaCausalAttention<kQueryHeads, kKvHeads, kWmmaQueryRows, kWmmaKeys>

@@ -96,8 +96,8 @@ __device__ __forceinline__ void StoreBlock(float x, std::uint32_t lane,
   const float scale = __half2float(d);
   const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
   const int q = min(127, max(-127, __float2int_rn(x * inverse)));
-  row[(block * kBlock) + lane] = static_cast<std::uint8_t>(
-      static_cast<std::int8_t>(q));
+  row[(block * kBlock) + lane] =
+      static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
   if (lane == 0)
     reinterpret_cast<__half*>(row + kScaleOffset)[block] = d;
 }

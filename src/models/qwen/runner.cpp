@@ -760,10 +760,10 @@ public:
     const bool speculative_enabled = DraftKind() != QwenDraftKind::kNone;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi = QwenStateAbi(DraftKind(),
-                                  execution_policy_.kv_cache_storage,
-                                  execution_policy_.UsesBf16RecurrentState()) +
-                     "-component-v2",
+        .state_abi =
+            QwenStateAbi(DraftKind(), execution_policy_.kv_cache_storage,
+                         execution_policy_.UsesBf16RecurrentState()) +
+            "-component-v2",
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{

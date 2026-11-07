@@ -83,8 +83,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
            << "kv_storage="
            << (execution_policy.UsesFp16AttentionKv() ? "fp16"
-               : execution_policy.UsesQ8AttentionKv()  ? "q8_0"
-                                                       : "fp32")
+               : execution_policy.UsesQ8AttentionKv() ? "q8_0"
+                                                      : "fp32")
            << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
