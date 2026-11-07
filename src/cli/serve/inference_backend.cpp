@@ -214,7 +214,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+                            bool enable_yarn, const std::string& kv_cache) {
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
   if (reader_owner == nullptr) {
@@ -227,6 +227,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "No text provider found for model architecture");
     return false;
   }
+  if (!kv_cache.empty() && kv_cache != "f16" && provider->id != "qwen27-q4") {
+    SetError(error,
+             "--kv-cache " + kv_cache + " is not supported by " + provider->id);
+    return false;
+  }
   ext::TextRunnerOptions options{
       .model_path = model_path,
       .reader = reader,
@@ -237,6 +242,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       .disk_cache = disk_cache_config,
       .ram_cache = ram_cache_config,
       .enable_yarn = enable_yarn,
+      .kv_cache = kv_cache,
   };
   auto runner = provider->create(options, error);
   if (runner == nullptr) {
@@ -258,7 +264,8 @@ bool InferenceBackend::load(const std::string&, std::string* error,
                             std::uint32_t, std::size_t, TextPrefillPolicy,
                             TextSchedulerPolicy, const TextSpeculativeConfig&,
                             const TextDiskCacheConfig&, const std::string&,
-                            TextRunnerRamCacheOptions, bool) {
+                            TextRunnerRamCacheOptions, bool,
+                            const std::string&) {
   SetError(error, "HIP engine is disabled");
   return false;
 }
