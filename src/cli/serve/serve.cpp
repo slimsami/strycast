@@ -686,6 +686,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::string kv_cache;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -711,6 +712,10 @@ void PrintServeHelp(std::string_view program_name,
                    "each session stays native until it holds more than "
                    "262144 tokens",
                    "Model", &enable_yarn);
+    parser.AddOption("", "--kv-cache", "TYPE",
+                     "Attention KV cache format: f16 (default) or q8_0 "
+                     "(8-bit, about half the KV memory; Qwen3.6-35B-A3B only)",
+                     "Model", &kv_cache);
 
     // Sampling Defaults
     parser.AddOption(
@@ -1361,6 +1366,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::string kv_cache;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1397,6 +1403,11 @@ int RunServe(std::span<const char* const> args) {
                        "262144; each session stays native until it holds more "
                        "than 262144 tokens",
                        "Model", &enable_yarn);
+    llm_parser.AddOption("", "--kv-cache", "TYPE",
+                         "Attention KV cache format: f16 (default) or q8_0 "
+                         "(8-bit, about half the KV memory; Qwen3.6-35B-A3B "
+                         "only)",
+                         "Model", &kv_cache);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1672,7 +1683,7 @@ int RunServe(std::span<const char* const> args) {
             .staging_capacity_bytes = cache_disk_staging_bytes,
             .model_artifact_fingerprint = {},
         },
-        vision_model_path, cache_ram, enable_yarn);
+        vision_model_path, cache_ram, enable_yarn, kv_cache);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

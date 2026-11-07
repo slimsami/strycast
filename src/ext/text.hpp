@@ -600,6 +600,9 @@ struct TextRunnerOptions {
   TextDiskCacheConfig disk_cache{};
   TextRunnerRamCacheOptions ram_cache{};
   bool enable_yarn{false};
+  /// Attention KV cache format: "f16" (default when empty) or "q8_0" (8-bit,
+  /// opt-in; Qwen3.6-35B-A3B only). Other providers accept only the default.
+  std::string kv_cache{};
 };
 
 struct TextBenchOptions {
