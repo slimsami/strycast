@@ -17,6 +17,9 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_ext_runtime
     gufo_ext_core
+    # The tokenizer and chat template use ICU, which a module build gets only
+    # through this target (Gufo's SDK exports ICU::uc).
+    ICU::uc
 )
 
 gufo_extension_target(
