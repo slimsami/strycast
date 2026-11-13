@@ -1,4 +1,5 @@
-// Wave32 split batched Q4_K MoE gate/up kernels (compiled without -mwavefrontsize64).
+// Wave32 split batched Q4_K, IQ3_S and IQ4_XS MoE gate/up kernels (compiled
+// without -mwavefrontsize64).
 #include "qfn_mmq_prelude.h"
 namespace qfn_mmq {
 #include "mmvq.hpp"
@@ -225,7 +226,190 @@ __launch_bounds__(32) static __global__ void mul_mat_vec_moe_batch_split_multi_w
   }
 }
 
+// IQ3_S and IQ4_XS: the same two kernels over the format's MMVQ dot product,
+// with the 32-lane order and reduction of the single-token kernel.
+template<ggml_type type>
+struct IqMoeTraits {
+  static constexpr int qi = ggml_hip_type_traits<type>::qi;
+  static constexpr int vdr = type == GGML_TYPE_IQ3_S ? VDR_IQ3_S_Q8_1_MMVQ
+                                                     : VDR_IQ4_XS_Q8_1_MMVQ;
+  static constexpr auto dot = type == GGML_TYPE_IQ3_S ? vec_dot_iq3_s_q8_1
+                                                      : vec_dot_iq4_xs_q8_1;
+};
+
+template<ggml_type type>
+__launch_bounds__(32) static __global__ void mul_mat_vec_moe_batch_split_single_iq_w32(
+    const void* __restrict__ gate, const void* __restrict__ up,
+    const block_q8_1* __restrict__ input, const int32_t* __restrict__ storage,
+    float* __restrict__ output, int k, int rows, int n_tokens, int experts_used,
+    int input_stride) {
+  using traits = IqMoeTraits<type>;
+  constexpr int rows_per_block = 4;
+  const int count = storage[1];
+  if (blockIdx.y >= count)
+    return;
+  const auto* multi_groups = reinterpret_cast<const MoeBatchGroup*>(storage + 2);
+  const auto* groups = multi_groups + n_tokens * experts_used;
+  constexpr int qk = QK_K;
+  constexpr int qi = traits::qi;
+  constexpr int vdr = traits::vdr;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row0 = blockIdx.x * rows_per_block;
+  const int blocks_per_row = k / qk;
+  const int kqs = vdr * (lane % (qi / vdr));
+  for (int anchor = blockIdx.y; anchor < count; anchor += gridDim.y) {
+    const auto& group = groups[anchor];
+    const int expert = group.expert;
+    const int token = group.token[0];
+    const uint32_t mask = group.slots[0];
+    float sum_g[rows_per_block] = {};
+    float sum_u[rows_per_block] = {};
+    for (int kb = lane / (qi / vdr); kb < blocks_per_row;
+         kb += blocks_per_iter) {
+      const auto* x = input + token * input_stride + kb * (qk / QK8_1);
+#pragma unroll
+      for (int r = 0; r < rows_per_block; ++r) {
+        const int b =
+            (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb;
+        sum_g[r] += traits::dot(gate, x, b, kqs);
+        sum_u[r] += traits::dot(up, x, b, kqs);
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+      sum_g[r] = warp_reduce_sum<32>(sum_g[r]);
+      sum_u[r] = warp_reduce_sum<32>(sum_u[r]);
+    }
+    if (lane < rows_per_block && row0 + lane < rows) {
+      float rg = sum_g[0], ru = sum_u[0];
+#pragma unroll
+      for (int r = 1; r < rows_per_block; ++r) {
+        if (lane == r) {
+          rg = sum_g[r];
+          ru = sum_u[r];
+        }
+      }
+      const float g = isfinite(rg) ? rg : 0.0f;
+      const float u = isfinite(ru) ? ru : 0.0f;
+      const float val = (g * (1.0f / (1.0f + __expf(-g)))) * u;
+      uint32_t bits = mask;
+      while (bits) {
+        const int slot = __ffs(static_cast<int>(bits)) - 1;
+        output[(token * experts_used + slot) * rows + row0 + lane] = val;
+        bits &= bits - 1;
+      }
+    }
+  }
+}
+
+template<ggml_type type>
+__launch_bounds__(32) static __global__ void mul_mat_vec_moe_batch_split_multi_iq_w32(
+    const void* __restrict__ gate, const void* __restrict__ up,
+    const block_q8_1* __restrict__ input, const int32_t* __restrict__ storage,
+    float* __restrict__ output, int k, int rows, int experts_used,
+    int input_stride) {
+  using traits = IqMoeTraits<type>;
+  constexpr int tokens = MMVQ_MAX_BATCH_SIZE;
+  const int count = storage[0];
+  if (blockIdx.y >= count)
+    return;
+  const auto* groups = reinterpret_cast<const MoeBatchGroup*>(storage + 2);
+  constexpr int qk = QK_K;
+  constexpr int qi = traits::qi;
+  constexpr int vdr = traits::vdr;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int blocks_per_row = k / qk;
+  const int kqs = vdr * (lane % (qi / vdr));
+  for (int anchor = blockIdx.y; anchor < count; anchor += gridDim.y) {
+    const auto& group = groups[anchor];
+    const int expert = group.expert;
+    if (expert < 0) {
+      if (expert == -2 && lane == 0)
+        output[group.anchor * rows + row] = 0.0f;
+      continue;
+    }
+    int tok[tokens];
+    uint32_t slots[tokens];
+    int ntok = 0;
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      tok[t] = group.token[t];
+      slots[t] = group.slots[t];
+      if (slots[t] != 0)
+        ++ntok;
+    }
+    float sum_g[tokens] = {};
+    float sum_u[tokens] = {};
+    for (int kb = lane / (qi / vdr); kb < blocks_per_row;
+         kb += blocks_per_iter) {
+      const int blk = (expert * rows + row) * blocks_per_row + kb;
+      if constexpr (type == GGML_TYPE_IQ3_S) {
+        // Decode each weight fragment once for every grouped input.
+        const Iq3sMoeFragment wg(gate, blk, kqs);
+        const Iq3sMoeFragment wu(up, blk, kqs);
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+          if (t >= ntok)
+            break;
+          const auto* x = input + tok[t] * input_stride + kb * (qk / QK8_1);
+          sum_g[t] += wg.Dot(x, kqs);
+          sum_u[t] += wu.Dot(x, kqs);
+        }
+      } else {
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+          if (t >= ntok)
+            break;
+          const auto* x = input + tok[t] * input_stride + kb * (qk / QK8_1);
+          sum_g[t] += traits::dot(gate, x, blk, kqs);
+          sum_u[t] += traits::dot(up, x, blk, kqs);
+        }
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      if (t >= ntok)
+        break;
+      const float rg = warp_reduce_sum<32>(sum_g[t]);
+      const float ru = warp_reduce_sum<32>(sum_u[t]);
+      if (lane == 0) {
+        const float g = isfinite(rg) ? rg : 0.0f;
+        const float u = isfinite(ru) ? ru : 0.0f;
+        const float val = (g * (1.0f / (1.0f + __expf(-g)))) * u;
+        uint32_t bits = slots[t];
+        while (bits) {
+          const int slot = __ffs(static_cast<int>(bits)) - 1;
+          output[(tok[t] * experts_used + slot) * rows + row] = val;
+          bits &= bits - 1;
+        }
+      }
+    }
+  }
+}
+
+template<ggml_type type>
+static void launch_moe_batch_iq_w32(const void* gate, const void* up,
+                                    const block_q8_1* input,
+                                    const int32_t* storage, float* output,
+                                    int k, int rows, int tokens,
+                                    int experts_used, int input_stride,
+                                    int multi_y, int single_y,
+                                    hipStream_t stream) {
+  mul_mat_vec_moe_batch_split_multi_iq_w32<type>
+      <<<dim3(rows, multi_y), 32, 0, stream>>>(gate, up, input, storage, output,
+                                               k, rows, experts_used,
+                                               input_stride);
+  mul_mat_vec_moe_batch_split_single_iq_w32<type>
+      <<<dim3((rows + 3) / 4, single_y), 32, 0, stream>>>(
+          gate, up, input, storage, output, k, rows, tokens, experts_used,
+          input_stride);
+}
+
 void mul_mat_vec_moe_batch_wave32_split(const void* gate, const void* up,
+                                       ggml_type type,
                                        const block_q8_1* input,
                                        const int32_t* storage, float* output,
                                        int k, int rows, int tokens,
@@ -234,6 +418,22 @@ void mul_mat_vec_moe_batch_wave32_split(const void* gate, const void* up,
   const int total_slots = tokens * experts_used;
   const int multi_y = min(64, max(1, total_slots / 2));
   const int single_y = min(256, total_slots);
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      break;
+    case GGML_TYPE_IQ3_S:
+      launch_moe_batch_iq_w32<GGML_TYPE_IQ3_S>(
+          gate, up, input, storage, output, k, rows, tokens, experts_used,
+          input_stride, multi_y, single_y, stream);
+      return;
+    case GGML_TYPE_IQ4_XS:
+      launch_moe_batch_iq_w32<GGML_TYPE_IQ4_XS>(
+          gate, up, input, storage, output, k, rows, tokens, experts_used,
+          input_stride, multi_y, single_y, stream);
+      return;
+    default:
+      GGML_ABORT("unsupported batched gate/up weight format");
+  }
   mul_mat_vec_moe_batch_split_multi_w32<<<dim3(rows, multi_y), 32, 0, stream>>>(
       gate, up, input, storage, output, k, rows, experts_used, input_stride);
   mul_mat_vec_moe_batch_split_single_w32

@@ -789,7 +789,8 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows || w.format_state != nullptr)
+  if (rows <= kDecodeRows || w.format_state != nullptr ||
+      w.type == core::GgmlType::kQ6_K)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
@@ -874,23 +875,26 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
-      l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
+  const auto gate_type = l.ffn_gate_exps.type;
+  if ((gate_type == core::GgmlType::kQ4_K ||
+       gate_type == core::GgmlType::kIQ3_S ||
+       gate_type == core::GgmlType::kIQ4_XS) &&
+      l.ffn_up_exps.type == gate_type) {
     const bool reuse_q8 =
         q8t_src_ == x && q8t_rows_ == rows && q8t_cols_ == c.hidden_size;
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
     const int gu_rc =
         reuse_q8 ? qfn_mmq_moe_gated_vec_preq(
-                       static_cast<int>(l.ffn_gate_exps.type),
-                       l.ffn_gate_exps.data, l.ffn_up_exps.data, base.x_q8t,
-                       base.ids, base.gate_e, c.expert_ff, c.hidden_size, rows,
-                       c.num_experts, c.num_experts_used, stream_)
+                       static_cast<int>(gate_type), l.ffn_gate_exps.data,
+                       l.ffn_up_exps.data, base.x_q8t, base.ids, base.gate_e,
+                       c.expert_ff, c.hidden_size, rows, c.num_experts,
+                       c.num_experts_used, stream_)
                  : qfn_mmq_moe_gated_vec(
-                       static_cast<int>(l.ffn_gate_exps.type),
-                       l.ffn_gate_exps.data, l.ffn_up_exps.data, x, base.ids,
-                       base.gate_e, c.expert_ff, c.hidden_size, rows,
-                       c.num_experts, c.num_experts_used, stream_);
+                       static_cast<int>(gate_type), l.ffn_gate_exps.data,
+                       l.ffn_up_exps.data, x, base.ids, base.gate_e,
+                       c.expert_ff, c.hidden_size, rows, c.num_experts,
+                       c.num_experts_used, stream_);
     if (gu_rc != 0 || qfn_mmq_moe_vec(static_cast<int>(l.ffn_down_exps.type),
                                       l.ffn_down_exps.data, base.gate_e,
                                       base.ids, base.down_e, c.hidden_size,
