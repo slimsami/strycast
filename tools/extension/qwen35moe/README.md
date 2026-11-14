@@ -7,6 +7,13 @@ external Gufo extension, so stock Gufo can load it with
 output of `generate.sh`, published by `.github/workflows/extension.yml` after
 each Strycast release and tagged with the release's tag.
 
+`extension.json` carries the version listed in Gufo's extension registry
+(gufo-org/gufo-extension), which requires a new `MAJOR.MINOR.PATCH` for every
+registered release. Bump `version` in a Strycast release that changes the
+extension, and set `api_version` to the extension API revision of the Gufo tag
+Strycast is based on (0.2.21 for v0.33.0: the number of records under
+`include/gufo/ext/changes/0.2/`, baseline excluded).
+
 ```sh
 tools/extension/qwen35moe/generate.sh /tmp/qwen35moe-extension [ref]
 ```
