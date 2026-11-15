@@ -192,12 +192,17 @@ static gufo::ReasoningOptions PromptReasoningOptions(
 static tokenization::ChatTemplateOptions PromptChatOptions(
     const ext::TextPromptOptions& options, const core::GgufReader& reader) {
   const auto reasoning = PromptReasoningOptions(options);
-  return tokenization::QwenChatTemplate::IsOrnithTemplate(
-             reader.GetMetadataString("tokenizer.chat_template").value_or(""))
-             ? tokenization::ResolveOrnithChatOptions(reasoning,
-                                                      options.add_vision_id)
-             : tokenization::ResolveQwenChatOptions(reasoning,
-                                                    options.add_vision_id);
+  const auto chat_template =
+      reader.GetMetadataString("tokenizer.chat_template").value_or("");
+  auto chat_options =
+      tokenization::QwenChatTemplate::IsOrnithTemplate(chat_template)
+          ? tokenization::ResolveOrnithChatOptions(reasoning,
+                                                   options.add_vision_id)
+          : tokenization::ResolveQwenChatOptions(reasoning,
+                                                 options.add_vision_id);
+  chat_options.reasoning_instruction =
+      tokenization::QwenChatTemplate::IsQwen38ReasoningTemplate(chat_template);
+  return chat_options;
 }
 
 void AttachImages(const ext::TextPromptOptions& opt,
@@ -249,15 +254,14 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
   const auto reasoning = PromptReasoningOptions(opt);
+  auto chat_options =
+      tokenizer.UsesOrnithChatTemplate()
+          ? tokenization::ResolveOrnithChatOptions(reasoning, opt.add_vision_id)
+          : tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id);
+  chat_options.reasoning_instruction = tokenizer.UsesQwen38ReasoningTemplate();
   return std::make_shared<models::qwen::vision::Prompt>(
-      models::qwen::vision::Prepare(
-          tokenizer, messages, {},
-          (tokenizer.UsesOrnithChatTemplate()
-               ? tokenization::ResolveOrnithChatOptions(reasoning,
-                                                        opt.add_vision_id)
-               : tokenization::ResolveQwenChatOptions(reasoning,
-                                                      opt.add_vision_id)),
-          encoder->identity(), kDefaultContext));
+      models::qwen::vision::Prepare(tokenizer, messages, {}, chat_options,
+                                    encoder->identity(), kDefaultContext));
 }
 
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(

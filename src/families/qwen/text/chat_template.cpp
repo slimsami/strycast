@@ -82,12 +82,6 @@ std::string TemplateSha256(std::string_view value) {
   return crypto::Sha256Hex({begin, value.size()});
 }
 
-bool IsQwen38ReasoningTemplate(std::string_view value) {
-  const std::string hash = TemplateSha256(value);
-  return hash == QwenChatTemplate::OfficialTemplateSha256() ||
-         hash == QwenChatTemplate::UnslothArtifactTemplateSha256();
-}
-
 bool IsQwen38Artifact(const core::GgufReader& reader) {
   const auto name = reader.GetMetadataString("general.name");
   if (name.has_value() && name->find("Qwen3.8") != std::string_view::npos) {
@@ -152,7 +146,7 @@ std::string PythonJsonSpacing(std::string_view value) {
 
 void AppendReasoningInstruction(std::string& output,
                                 const ChatTemplateOptions& options) {
-  if (!options.enable_thinking ||
+  if (!options.enable_thinking || !options.reasoning_instruction ||
       options.dialect == ChatTemplateOptions::Dialect::kOrnith) {
     return;
   }
@@ -563,6 +557,12 @@ bool QwenChatTemplate::IsOrnithTemplate(std::string_view raw_template) {
   return raw_template.ends_with("\n") &&
          TemplateSha256(raw_template.substr(0, raw_template.size() - 1)) ==
              OrnithTemplateSha256();
+}
+
+bool QwenChatTemplate::IsQwen38ReasoningTemplate(std::string_view value) {
+  const std::string hash = TemplateSha256(value);
+  return hash == OfficialTemplateSha256() ||
+         hash == UnslothArtifactTemplateSha256();
 }
 
 std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
