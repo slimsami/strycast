@@ -111,6 +111,11 @@ struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{true};
   QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
+  /// Strycast: the "Reasoning effort is set to ..." system text belongs to the
+  /// pinned Qwen3.8 templates only. Older Qwen templates (Qwen3.5/3.6) do not
+  /// emit it, so serving them sets this to false to match their reference
+  /// prompt (slimsami/strycast#62).
+  bool reasoning_instruction{true};
   bool preserve_thinking{true};
   bool add_vision_id{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
@@ -200,6 +205,11 @@ public:
   }
 
   [[nodiscard]] static bool IsOrnithTemplate(std::string_view raw_template);
+
+  /// True for the pinned Qwen3.8 reasoning templates, the only ones whose
+  /// reference rendering carries the reasoning-effort system instruction.
+  [[nodiscard]] static bool IsQwen38ReasoningTemplate(
+      std::string_view raw_template);
 
   /// Formats a list of messages into a deterministic UTF-8 prompt string.
   [[nodiscard]] static std::optional<std::string> Render(

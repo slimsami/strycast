@@ -97,6 +97,7 @@ tokenization::ChatTemplateOptions QwenChatOptions(
                            request.reasoning, request.add_vision_id)
                      : tokenization::ResolveQwenChatOptions(
                            request.reasoning, request.add_vision_id);
+  options.reasoning_instruction = tokenizer.UsesQwen38ReasoningTemplate();
   // gufo #285: the rendered prompt may be as long as the context can hold.
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);

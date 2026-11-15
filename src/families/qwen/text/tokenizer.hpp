@@ -77,6 +77,10 @@ public:
   [[nodiscard]] bool UsesOrnithChatTemplate() const noexcept {
     return ornith_chat_template_;
   }
+  /// True when the GGUF carries a pinned Qwen3.8 reasoning template.
+  [[nodiscard]] bool UsesQwen38ReasoningTemplate() const noexcept {
+    return qwen38_reasoning_template_;
+  }
 
   [[nodiscard]] TokenId GetEosTokenId() const noexcept { return eos_token_id_; }
   [[nodiscard]] TokenId GetBosTokenId() const noexcept { return bos_token_id_; }
@@ -99,6 +103,7 @@ public:
 
 private:
   bool ornith_chat_template_{false};
+  bool qwen38_reasoning_template_{false};
 
   enum class PreTokenizer : std::uint8_t {
     kNone,

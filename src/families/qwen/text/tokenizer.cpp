@@ -375,8 +375,12 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   if (tokenizer == nullptr) {
     return nullptr;
   }
-  tokenizer->ornith_chat_template_ = QwenChatTemplate::IsOrnithTemplate(
-      reader.GetMetadataString("tokenizer.chat_template").value_or(""));
+  const auto chat_template =
+      reader.GetMetadataString("tokenizer.chat_template").value_or("");
+  tokenizer->ornith_chat_template_ =
+      QwenChatTemplate::IsOrnithTemplate(chat_template);
+  tokenizer->qwen38_reasoning_template_ =
+      QwenChatTemplate::IsQwen38ReasoningTemplate(chat_template);
   if (reader.GetMetadataString("tokenizer.ggml.pre") ==
       std::optional<std::string_view>{"qwen35"}) {
     tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;

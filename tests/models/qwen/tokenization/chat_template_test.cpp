@@ -204,6 +204,50 @@ void TestReasoningEffortAndPreservation() {
          "Thinking generation starts inside the reasoning block");
 }
 
+// Strycast #62: Qwen3.5/3.6 templates have no reasoning-effort text, so a
+// prompt rendered for them must not carry one, whatever the requested effort.
+void TestReasoningInstructionFollowsTemplate() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::ChatTemplateOptions;
+  using gufo::tokenization::QwenChatTemplate;
+  using gufo::tokenization::QwenReasoningEffort;
+  const std::vector<ChatMessage> messages = {
+      {ChatRole::kSystem, "System rules.", "", ""},
+      {ChatRole::kUser, "Question.", "", ""},
+  };
+  for (const auto effort :
+       {QwenReasoningEffort::kLow, QwenReasoningEffort::kMedium,
+        QwenReasoningEffort::kXHigh}) {
+    ChatTemplateOptions options;
+    options.enable_thinking = true;
+    options.reasoning_effort = effort;
+    options.reasoning_instruction = false;
+    const auto rendered = QwenChatTemplate::Render(messages, options);
+    Expect(rendered.has_value(), "Legacy template renders");
+    Expect(*rendered ==
+               "<|im_start|>system\nSystem rules.<|im_end|>\n"
+               "<|im_start|>user\nQuestion.<|im_end|>\n"
+               "<|im_start|>assistant\n<think>\n",
+           "Legacy template prompt carries no reasoning-effort instruction");
+  }
+  ChatTemplateOptions options;
+  options.enable_thinking = true;
+  const auto rendered = QwenChatTemplate::Render(messages, options);
+  Expect(rendered.has_value() &&
+             rendered->find("Reasoning effort is set to xhigh.") !=
+                 std::string::npos,
+         "Qwen3.8 rendering keeps the default xhigh instruction");
+  Expect(QwenChatTemplate::IsQwen38ReasoningTemplate(
+             ReadText(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE)),
+         "Official Qwen3.8 template is a reasoning template");
+  Expect(!QwenChatTemplate::IsQwen38ReasoningTemplate(""),
+         "Empty template is not a Qwen3.8 reasoning template");
+  Expect(!QwenChatTemplate::IsQwen38ReasoningTemplate(
+             QwenChatTemplate::CreateDefault()->GetTemplateString()),
+         "Default ChatML template is not a Qwen3.8 reasoning template");
+}
+
 void TestBoundedOutputLimit() {
   auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
@@ -1278,6 +1322,7 @@ int main() {
   TestThinkingFraming();
   TestHistoricalThinkingDoesNotEnableNewThinking();
   TestReasoningEffortAndPreservation();
+  TestReasoningInstructionFollowsTemplate();
   TestBoundedOutputLimit();
   TestRenderedPromptBoundFollowsContext();
   TestGgufTemplateExtraction();
