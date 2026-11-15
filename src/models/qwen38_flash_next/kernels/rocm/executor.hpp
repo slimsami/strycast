@@ -705,7 +705,8 @@ private:
   /// Times every layer's one-row MoE with and without the shared-expert
   /// overlap and keeps the faster layout in decode_overlap_. Create calls it
   /// once, after allocating scratch (about 120 ms). Touches only scratch and
-  /// restores DispatchState: no session or model state.
+  /// restores DispatchState: no session or model state. On Linux it only
+  /// enables the overlap and runs no passes.
   bool CalibrateDecodeOverlap(std::string* error_msg);
 
   const DeviceModel* model_{nullptr};
@@ -730,8 +731,10 @@ private:
   /// cross-stream dependencies cost depends on the runtime. On Linux/ROCm
   /// 10.1 they are cheap and the overlap speeds decode up about 1.5%. On
   /// Windows/TheRock 10.0 they cost about 50 us per layer, more than the
-  /// whole shared expert takes (issue #1107). Create measures both layouts
-  /// (CalibrateDecodeOverlap). Wide and prefill passes always overlap.
+  /// whole shared expert takes (issue #1107). On Windows, Create measures
+  /// both layouts (CalibrateDecodeOverlap); on Linux it keeps the overlap
+  /// without timing it, since the timing passes slow later multi-user decode.
+  /// Wide and prefill passes always overlap.
   bool decode_overlap_{false};
   /// True only while Run records a graph. Overlapped launches check capture
   /// membership at the fork; eager/replay tests separately check the results.

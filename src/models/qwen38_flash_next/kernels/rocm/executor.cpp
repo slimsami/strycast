@@ -1334,6 +1334,19 @@ bool Executor::CalibrateDecodeOverlap(std::string* error_msg) {
                l.shexp_down.type == GgmlType::kQ8_0;
       }))
     return true;
+#if !defined(_WIN32)
+  // Strycast: on Linux the overlap is the faster layout (the timing below picks
+  // it too: 9.7 vs 10.2 ms per one-row pass on Strix Halo, ROCm 10.1), and the
+  // timing itself costs more than it measures. Running these eager MoE passes
+  // before any session exists left multi-user MTP decode 11-13% slower for
+  // the life of the process (Flash-Next UD-Q4_K_XL, 4-8 users), whichever
+  // layout was then chosen; releasing the MMQ scratch arena afterwards only
+  // recovered part of it. Keep the pre-calibration behaviour here and time
+  // the layouts only where the fork/join cost is known to vary (Windows).
+  (void)error_msg;
+  decode_overlap_ = true;
+  return true;
+#else
   // One decode row through every layer: the weights stream from memory as
   // they do in decode instead of being reread from cache.
   std::vector<float> row(config().hidden_size);
@@ -1381,6 +1394,7 @@ bool Executor::CalibrateDecodeOverlap(std::string* error_msg) {
   // either choice changes only speed.
   decode_overlap_ = best[1] < best[0];
   return true;
+#endif
 }
 
 std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
