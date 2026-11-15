@@ -238,8 +238,12 @@ void TestReasoningInstructionFollowsTemplate() {
              rendered->find("Reasoning effort is set to xhigh.") !=
                  std::string::npos,
          "Qwen3.8 rendering keeps the default xhigh instruction");
-  Expect(QwenChatTemplate::IsQwen38ReasoningTemplate(
-             ReadText(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE)),
+  // The reference file ends with a newline the GGUF metadata does not carry.
+  std::string official = ReadText(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE);
+  if (official.ends_with('\n')) {
+    official.pop_back();
+  }
+  Expect(QwenChatTemplate::IsQwen38ReasoningTemplate(official),
          "Official Qwen3.8 template is a reasoning template");
   Expect(!QwenChatTemplate::IsQwen38ReasoningTemplate(""),
          "Empty template is not a Qwen3.8 reasoning template");
