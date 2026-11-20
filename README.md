@@ -33,6 +33,15 @@ Ornith 1.5 122B was contributed by [@lucasmcoleman](https://github.com/lucasmcol
 in [#12](https://github.com/slimsami/strycast/pull/12), formerly
 [gufo-org/gufo#735](https://github.com/gufo-org/gufo/pull/735).
 
+### Maintainers
+
+- [@slimsami](https://github.com/slimsami)
+- [@brunobarbosaux-ai](https://github.com/brunobarbosaux-ai): the
+  serve-path quality gates ([#58](https://github.com/slimsami/strycast/pull/58))
+  on model and quantization PRs, quantization-kernel reviews, and shared
+  rebase and release duty. Maintainer of the
+  [Flint](https://github.com/gufo-org/gufo-extension) extension for Gufo.
+
 ### Credits
 
 - [@lucasmcoleman](https://github.com/lucasmcoleman) brought
