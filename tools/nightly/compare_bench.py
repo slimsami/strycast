@@ -11,7 +11,7 @@ regression move to NEW_DIR/first and FILE lists the tables to measure again, one
 `INDEX CONFIG TABLE` line each (INDEX counts the LABEL groups from 0; CONFIG
 bench-arhash.json is the AR reference config run.sh writes). The next comparison
 keeps the best measurement of each value, from NEW_DIR, NEW_DIR/first and
-NEW_DIR/again (an extra single-user measurement).
+NEW_DIR/again (an extra single-user or multi-user MTP measurement).
 """
 
 import json
