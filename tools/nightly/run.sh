@@ -298,6 +298,10 @@ PY
   # (Ornith pp at 8K: 940 or 981 tok/s on one binary), so they are measured
   # twice more on the same prompts, and the best of the three counts. A mean
   # over other prompts (--repetitions) cannot recover a slow first run.
+  # Multi-user MTP tables are measured twice more too: their concurrent rows
+  # sit at one of three levels on one binary (35B Q8 repetition at 4 users:
+  # 144.5, 141.5 or 130.6 tok/s), depending on whether a request drafts before
+  # the others join the batch and so falls out of step with identical prompts.
   python3 "$src/tools/nightly/compare_bench.py" --set-aside "$out/bench-retry.txt" "${groups[@]}" > /dev/null
   local index config table group pass passes
   measuring_again=1
@@ -305,7 +309,7 @@ PY
     group=$art/35b
     [ "$index" = 0 ] || group=$art/ornith
     passes=1
-    [[ $table = single-* ]] && passes=2
+    [[ $table = single-* || $table = multi-mtp-* ]] && passes=2
     for ((pass = 1; pass <= passes; pass++)); do
       late "measuring $table again" && break 2
       log "measure $table again ($pass/$passes)"
@@ -319,7 +323,12 @@ PY
       # Keep this pass's artifacts beside the first ones for compare_bench.py.
       if [ "$pass" -lt "$passes" ]; then
         mkdir -p "$group/again"
-        mv -f "$group/${table%-*}"*"-${table##*-}-gufo.json" "$group/again/" 2>/dev/null || true
+        if [[ $table = multi-mtp-* ]]; then
+          # Multi-user artifacts are named by workload and end with the mode.
+          mv -f "$group/multi-"*"-${table##*-}-gufo-mtp.json" "$group/again/" 2>/dev/null || true
+        else
+          mv -f "$group/${table%-*}"*"-${table##*-}-gufo.json" "$group/again/" 2>/dev/null || true
+        fi
       fi
     done
   done < "$out/bench-retry.txt"
