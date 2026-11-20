@@ -51,6 +51,18 @@ if (ENGINE_ENABLE_HIP)
       select_ops snapshot_copy verification_sampling wide_verification)
     add_qwen38_flash_next_test(${name} qwen38_flash_next_test_hip "hip;gpu;gfx1151")
   endforeach()
+  # Device-function check on the vendored IQ2_S/IQ3_XXS dot products. It
+  # compiles its own copy of the header-only tier, so it links no kernel library.
+  add_executable(qwen38_flash_next_iq_fractional_dot_test iq_fractional_dot_test.hip)
+  target_include_directories(qwen38_flash_next_iq_fractional_dot_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  target_link_libraries(qwen38_flash_next_iq_fractional_dot_test PRIVATE
+    gufo_core hip::host)
+  add_test(NAME qwen38_flash_next.iq_fractional_dot
+    COMMAND qwen38_flash_next_iq_fractional_dot_test)
+  set_tests_properties(qwen38_flash_next.iq_fractional_dot PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151" SKIP_RETURN_CODE 77)
+  add_dependencies(qwen38_flash_next_tests qwen38_flash_next_iq_fractional_dot_test)
   # Reuse the synthetic model fixture, with short prompts around a reduced
   # sparse budget. This exercises actual Executor capture/replay without GGUFs.
   add_test(NAME qwen38_flash_next.decode_graph
