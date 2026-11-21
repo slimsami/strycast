@@ -151,7 +151,7 @@
         },
         "multi-repetition": {
           "label": "repetitive",
-          "corpus_layout": "homogeneous",
+          "distinct_prompts": 8,
           "workload": "repetition"
         }
       }
