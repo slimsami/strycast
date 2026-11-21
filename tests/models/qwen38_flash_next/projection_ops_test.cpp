@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -81,7 +82,7 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed,
 // its actual consumer, including the state carried into the next chunk.
 void CheckSsmProjection(const void* w, const __half* x, float* projected,
                         const std::vector<float>& reference,
-                        std::uint32_t batch) {
+                        std::uint32_t batch, bool q6 = false) {
   constexpr std::uint32_t m = 16384, k = 2560, channels = 10240;
   constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
   const std::size_t conv_count = std::size_t(batch) * channels;
@@ -191,7 +192,8 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
     CheckHip(hipDeviceSynchronize(), "SSM inputs");
     if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
                             k, channels, 4, replay == 2 ? main_stream : nullptr,
-                            {}, replay == 2 ? z_stream : nullptr, z_start)) {
+                            {}, replay == 2 ? z_stream : nullptr, z_start,
+                            q6)) {
       throw std::runtime_error("SSM projection rejected the shape");
     }
     CheckHip(hipDeviceSynchronize(), "SSM projection");
@@ -231,7 +233,8 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
 void CheckAttentionProjection(
     const void* weights, const __half* input, const float* projected,
     std::uint32_t batch,
-    const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
+    const gufo::models::qwen38_flash_next::YarnRope& yarn = {},
+    bool q6 = false) {
   constexpr std::uint32_t start = 131069;
   const std::size_t query_bytes = (std::size_t(batch) * 6144 + 16) * 4;
   const std::size_t cache_bytes =
@@ -293,7 +296,7 @@ void CheckAttentionProjection(
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, position,
-                           1e7F, 1e-6F, stream, vision.rope(), yarn))
+                           1e7F, 1e-6F, stream, vision.rope(), yarn, q6))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
@@ -325,7 +328,7 @@ void CheckAttentionProjection(
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
                           static_cast<__half*>(actual[3]) + 8, 0, position,
-                          1e7F, 1e-6F, nullptr, nullptr, yarn))
+                          1e7F, 1e-6F, nullptr, nullptr, yarn, q6))
     throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
@@ -1293,11 +1296,124 @@ void CheckW8A8PassWidths(std::size_t m, std::size_t k, std::size_t wide,
             << wide << " rows: exact\n";
 }
 
+/// The Q6_K F16 route (the Dynamic 3.1 trunk in prefill): within tolerance
+/// of an F64 product over the CPU decoder, and every short pass's rows bit
+/// for bit equal to the same rows of the wide pass.
+void CheckQ6KF16(std::size_t m, std::size_t k, std::size_t wide,
+                 std::uint32_t seed) {
+  constexpr std::size_t kBlockBytes = 210;
+  std::vector<std::uint8_t> blocks(m * (k / 256) * kBlockBytes);
+  std::uint32_t state = seed;
+  for (auto& b : blocks)
+    b = static_cast<std::uint8_t>(NextRandom(&state) >> 24);
+  for (std::size_t b = 0; b < blocks.size(); b += kBlockBytes) {
+    // The int8 sub-block scales multiply d: keep weights near 0.02.
+    const __half d = __float2half(1e-5F * (1.0F + Uniform(&state, 0.5F)));
+    std::memcpy(blocks.data() + b + 208, &d, 2);
+  }
+  std::vector<float> values(m * k);
+  for (std::size_t r = 0; r < m; ++r)
+    gufo::quant::DequantizeQ6_K(blocks.data() + r * (k / 256) * kBlockBytes,
+                                values.data() + r * k, k);
+  std::vector<float> x(wide * k);
+  for (float& v : x)
+    v = Uniform(&state, 2.0F);
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_wide = nullptr;
+  float* d_short = nullptr;
+  CheckHip(hipMalloc(&d_w, blocks.size() + 4096), "Q6_K weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "Q6_K input");
+  CheckHip(hipMalloc(&d_wide, wide * m * 4), "Q6_K wide output");
+  CheckHip(hipMalloc(&d_short, wide * m * 4), "Q6_K short output");
+  CheckHip(hipMemcpy(d_w, blocks.data(), blocks.size(), hipMemcpyHostToDevice),
+           "Q6_K weight upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "Q6_K input upload");
+  __half* d_half = nullptr;
+  CheckHip(hipMalloc(&d_half, wide * k * sizeof(__half)), "Q6_K F16 input");
+  q::NarrowActivations(d_x, d_half, false, wide * k, nullptr);
+  const auto project = [&](std::size_t first, std::size_t rows, float* out) {
+    if (!q::DenseQ6F16Gemm(d_w, d_half + first * k, out, rows, m, k, nullptr))
+      throw std::runtime_error("Q6_K F16 pass rejected");
+  };
+  project(0, wide, d_wide);
+  std::vector<float> expected(wide * m);
+  CheckHip(hipMemcpy(expected.data(), d_wide, expected.size() * 4,
+                     hipMemcpyDeviceToHost),
+           "Q6_K wide download");
+  double err_sq = 0.0;
+  double ref_sq = 0.0;
+  for (std::size_t t = 0; t < wide; t += 7) {
+    for (std::size_t r = 0; r < m; ++r) {
+      double ref = 0.0;
+      for (std::size_t i = 0; i < k; ++i)
+        ref += static_cast<double>(values[r * k + i]) * x[t * k + i];
+      const double diff = expected[t * m + r] - ref;
+      err_sq += diff * diff;
+      ref_sq += ref * ref;
+    }
+  }
+  const double rel = std::sqrt(err_sq / ref_sq);
+  std::size_t failures = 0;
+  for (const std::size_t rows : {1, 7, 9, 95, 96, 129, 1031}) {
+    if (rows > wide)
+      continue;
+    for (const std::size_t first :
+         {std::size_t{0}, (wide - rows) / 2, wide - rows}) {
+      project(first, rows, d_short);
+      std::vector<float> actual(rows * m);
+      CheckHip(hipMemcpy(actual.data(), d_short, actual.size() * 4,
+                         hipMemcpyDeviceToHost),
+               "Q6_K short download");
+      for (std::size_t r = 0; r < rows; ++r)
+        failures += std::memcmp(actual.data() + r * m,
+                                expected.data() + (first + r) * m, m * 4) != 0;
+    }
+  }
+  // The stacked SSM input projection: the fused prefill route against these
+  // plain rows.
+  if (m == 16384 && k == 2560)
+    CheckSsmProjection(d_w, d_half, d_wide, expected,
+                       static_cast<std::uint32_t>(wide), true);
+  // The stacked attention projection: the fused route (norms, RoPE, cache
+  // writes) against these plain rows.
+  if (m == 13312 && k == 2560) {
+    CheckAttentionProjection(d_w, d_half, d_wide,
+                             static_cast<std::uint32_t>(wide), {}, true);
+    CheckAttentionProjection(
+        d_w, d_half, d_wide, static_cast<std::uint32_t>(wide),
+        gufo::models::qwen38_flash_next::MakeYarnRope(
+            {.factor = 2.5F, .original_context = 262144}, 64, 1e7F),
+        true);
+  }
+  (void)hipFree(d_w);
+  (void)hipFree(d_x);
+  (void)hipFree(d_half);
+  (void)hipFree(d_wide);
+  (void)hipFree(d_short);
+  std::cout << "Q6_K F16" << " m=" << m << " k=" << k << " rows=" << wide
+            << ": rel err " << rel << ", " << failures
+            << " short-pass rows differ\n";
+  if (rel > 1e-2)
+    throw std::runtime_error("Q6_K projection is inaccurate");
+  if (failures != 0)
+    throw std::runtime_error("Q6_K projection rows depend on the pass width");
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckHip(q::PrepareW8A8GemmWave64(), "prepare wide Q8 projection");
+    // Dynamic 3.1 Q6_K trunk shapes: the shared expert, attn_qkv, ssm_out
+    // and attn_output (K 6144), with ragged token counts.
+    CheckQ6KF16(640, 2560, 1619, 0x6C0640U);
+    CheckQ6KF16(10240, 2560, 1549, 0x6CA240U);
+    CheckQ6KF16(16384, 2560, 1549, 0x6C4000U);
+    CheckQ6KF16(13312, 2560, 1549, 0x6C3400U);
+    CheckQ6KF16(2560, 6144, 1549, 0x6C6144U);
+    CheckQ6KF16(201, 2560, 97, 0x6C0201U);
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();

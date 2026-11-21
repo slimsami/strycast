@@ -104,7 +104,9 @@ struct Uploader {
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
-    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
+    // Q6_K dense projections read F16 activation rows in prefill too.
+    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16 ||
+        (t.type == core::GgmlType::kQ6_K && t.experts == 1)) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
     if ((t.type == core::GgmlType::kQ8_0 || t.type == core::GgmlType::kQ6_K) &&
@@ -243,8 +245,9 @@ struct Uploader {
     const core::GgmlType type = (*parts.begin())->type;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0 &&
+           type != core::GgmlType::kQ6_K)) {
+        Fail("stacked upload needs F32, Q8_0 or Q6_K tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -268,7 +271,8 @@ struct Uploader {
         offset += t->SizeBytes();
       }
     }
-    if (type == core::GgmlType::kQ8_0 && !expand_q8) {
+    if ((type == core::GgmlType::kQ8_0 && !expand_q8) ||
+        type == core::GgmlType::kQ6_K) {
       if (Measuring()) {
         return d;
       }
@@ -279,6 +283,9 @@ struct Uploader {
       d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
       d.rows = static_cast<std::uint32_t>(rows);
       max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      // Q6_K projections read F16 activation rows in prefill.
+      if (type == core::GgmlType::kQ6_K)
+        max_half_cols = std::max<std::size_t>(max_half_cols, d.cols);
       return d;
     }
     void* f32 = ptr;
@@ -331,17 +338,23 @@ struct Uploader {
     d.hc_attn = Mixer(l.hc_attn);
     d.hc_ffn = Mixer(l.hc_ffn);
     // Projections of one input are stacked into one Q8_0 GEMV where the
-    // quantization allows; otherwise they stay separate.
-    const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
+    // quantization allows; otherwise they stay separate. Q6_K SSM and
+    // attention inputs stack too, for the fused prefill projections (their
+    // rows keep the single-row GEMV arithmetic in decode).
+    const auto stackable = [](std::initializer_list<const TensorRef*> parts,
+                              bool q6 = false) {
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+        if (t->empty() ||
+            (t->type != core::GgmlType::kQ8_0 &&
+             !(q6 && t->type == core::GgmlType::kQ6_K)) ||
+            t->type != (*parts.begin())->type ||
             t->cols != (*parts.begin())->cols) {
           return false;
         }
       }
       return true;
     };
-    if (l.linear && stackable({&l.ssm_qkv, &l.ssm_gate})) {
+    if (l.linear && stackable({&l.ssm_qkv, &l.ssm_gate}, true)) {
       d.ssm_in = Stack({&l.ssm_qkv, &l.ssm_gate});
     } else {
       d.ssm_qkv = Copy(l.ssm_qkv);
@@ -355,7 +368,7 @@ struct Uploader {
     d.ssm_a = Copy(l.ssm_a);
     d.ssm_norm = Copy(l.ssm_norm);
     d.ssm_out = Copy(l.ssm_out);
-    if (!l.linear && stackable({&l.attn_q, &l.attn_k, &l.attn_v})) {
+    if (!l.linear && stackable({&l.attn_q, &l.attn_k, &l.attn_v}, true)) {
       d.attn_qkv = Stack({&l.attn_q, &l.attn_k, &l.attn_v});
     } else {
       d.attn_q = Copy(l.attn_q);
@@ -456,13 +469,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but of the production kernels only the
-  // logits head does. Reject it elsewhere before allocating device weights.
+  // Dense Q6_K runs through the vector GEMV and the embedding lookup; the
+  // routed expert kernels have no Q6_K route. Reject that before allocating
+  // device weights.
   const auto supported = [&](const TensorRef& t) {
     if (t.type != core::GgmlType::kQ6_K)
       return true;
     if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
+      *error_msg = "unsupported HIP expert format Q6_K: " + std::string(t.name);
     return false;
   };
   const auto layer_supported = [&](const LayerWeights& l) {
@@ -490,9 +504,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                    std::string(l.ffn_gate_exps.name);
     return false;
   };
-  // A tied head has the embedding's type, so the embedding check rejects it.
-  if (!supported(w.token_embd) ||
-      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
+  if (!std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !mtp_block_supported(mtp->block))) {
     return nullptr;
   }
