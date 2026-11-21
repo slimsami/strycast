@@ -227,15 +227,18 @@ std::shared_ptr<models::qwen::vision::Encoder> LoadQwenVision(
     const ext::TextPromptOptions& opt, const core::GgufReader& reader) {
   if (opt.image_paths.empty() && opt.vision_model_path.empty())
     return {};
-  // The Qwen3.8-27B and Ornith-1.5-122B (qwen35moe) trunks take the shared
-  // vision tower at their own width.
-  const std::uint32_t width =
-      reader.GetMetadataUint64("qwen35.embedding_length") == 5120      ? 5120
-      : reader.GetMetadataUint64("qwen35moe.embedding_length") == 3072 ? 3072
-                                                                       : 0;
+  // The Qwen3.8-27B, Ornith-1.5-122B and Qwen3.6-35B-A3B (qwen35moe) trunks
+  // take the shared vision tower at their own width.
+  const auto qwen35_width = reader.GetMetadataUint64("qwen35.embedding_length");
+  const auto moe_width = reader.GetMetadataUint64("qwen35moe.embedding_length");
+  const std::uint32_t width = qwen35_width == 5120 ? 5120
+                              : moe_width == 3072  ? 3072
+                              : moe_width == 2048  ? 2048
+                                                   : 0;
   if (width == 0) {
     throw std::invalid_argument(
-        "image input supports Qwen3.8-27B, Ornith-1.5-122B and Flash-Next");
+        "image input supports Qwen3.8-27B, Qwen3.6-35B-A3B, Ornith-1.5-122B "
+        "and Flash-Next");
   }
   auto encoder = models::qwen::vision::Encoder::Open(
       opt.model_path, opt.vision_model_path, width);
