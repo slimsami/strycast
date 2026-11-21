@@ -118,12 +118,28 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   }
 
   tokenization::TokenId next_token = 0;
-  for (std::size_t offset = 0; offset < prompt_tokens.size();
-       offset += arena_.GetMaxBatch()) {
+  // With block-sparse attention the last rows of a prompt (the question) are
+  // run apart and dense: they have to find things anywhere in the context, and
+  // a selection made from a tile's mean query does not reliably find them.
+  const std::size_t dense_tail =
+      (arena_.sparse_enabled && compute_logits)
+          ? std::min<std::size_t>(arena_.dense_tail_rows, prompt_tokens.size())
+          : 0;
+  const std::size_t sparse_rows = prompt_tokens.size() - dense_tail;
+  for (std::size_t offset = 0; offset < prompt_tokens.size();) {
     CheckPrefillCancellation();
-    const std::size_t chunk_size = std::min<std::size_t>(
-        arena_.GetMaxBatch(), prompt_tokens.size() - offset);
+    const bool tail_chunk = dense_tail != 0 && offset >= sparse_rows;
+    const std::size_t region_end =
+        tail_chunk || dense_tail == 0 ? prompt_tokens.size() : sparse_rows;
+    const std::size_t chunk_size =
+        std::min<std::size_t>(arena_.GetMaxBatch(), region_end - offset);
     const bool is_last = offset + chunk_size == prompt_tokens.size();
+    struct Suspend {
+      bool& flag;
+      bool previous;
+      Suspend(bool& f, bool on) : flag(f), previous(f) { flag = flag || on; }
+      ~Suspend() { flag = previous; }
+    } suspend(arena_.sparse_suspended, tail_chunk);
     const auto chunk = prompt_tokens.subspan(offset, chunk_size);
     const auto chunk_pos = start_pos + static_cast<std::uint32_t>(offset);
     next_token =
@@ -131,6 +147,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
             ? ForwardSmallPromptChunk(chunk, chunk_pos,
                                       compute_logits && is_last)
             : ForwardPromptChunk(chunk, chunk_pos, compute_logits && is_last);
+    offset += chunk_size;
   }
   return next_token;
 }

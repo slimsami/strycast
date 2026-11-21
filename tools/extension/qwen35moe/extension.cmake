@@ -29,6 +29,7 @@ gufo_extension_target(
     q35/family/kernels/attention_decode_graph.hip
     q35/family/kernels/attention_decode.hip
     q35/family/kernels/attention_decode_verify_wave64.hip
+    q35/family/kernels/attention_sparse.hip
     q35/family/kernels/attention_tile.hip
     q35/family/kernels/attention_wmma.hip
     q35/family/kernels/attention_wmma_decode.hip
@@ -81,7 +82,7 @@ if(TARGET strycast_q35_kernels)
   set(K ${Q35}/family/kernels)
   set_source_files_properties(
     ${K}/attention_batched.hip ${K}/attention_decode_graph.hip ${K}/attention_decode.hip
-    ${K}/attention_decode_verify_wave64.hip ${K}/attention_tile.hip ${K}/attention_wmma.hip
+    ${K}/attention_decode_verify_wave64.hip ${K}/attention_sparse.hip ${K}/attention_tile.hip ${K}/attention_wmma.hip
     ${K}/attention_wmma_decode.hip ${K}/dflash_kernels.hip ${K}/embed.hip ${K}/fused.hip
     ${K}/gemv.hip ${K}/gemv_quant.hip ${K}/hipblas_gemm.hip ${K}/hipblaslt_gemm.hip
     ${K}/moe.hip ${K}/routed_f16.hip ${K}/norm.hip ${K}/prefill_embed.hip ${K}/prefill_fp16.hip
