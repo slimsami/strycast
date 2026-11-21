@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <gufo/ext/experimental/hip_graph_decode_executor.hpp>
 
 #include "src/families/qwen/hip_common/execution_policy.hpp"
+#include "src/families/qwen/kernels/ops/attention.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/families/qwen/kernels/ops/ssm.hpp"
 #include "src/families/qwen/kernels/ops/token.hpp"
@@ -396,6 +398,31 @@ public:
   float* d_ssm_alpha_beta{nullptr};
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
+  /// Opt-in block-sparse prefill attention (STRYCAST_SPARSE_ATTN): per-layer
+  /// key min/max bounds, per-tile block lists, and how many keys the bounds
+  /// of each full-attention layer already cover.
+  void* d_sparse_pooled{nullptr};
+  std::int32_t* d_sparse_lists{nullptr};
+  std::vector<std::uint32_t> sparse_pooled_end;
+  SparseAttentionConfig sparse_config{};
+  bool sparse_enabled{false};
+  /// Set while the last rows of a prompt run: the question that follows a long
+  /// document has to see all of it, so these rows use the dense kernels.
+  bool sparse_suspended{false};
+  /// Prompt rows kept dense at the end of a prefill
+  /// (STRYCAST_SPARSE_DENSE_TAIL).
+  std::uint32_t dense_tail_rows{1024};
+  /// Cached rows changed under the bounds (restore, reset): pool again.
+  void InvalidateSparseAttention() noexcept {
+    std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
+  }
+  /// A dense route wrote cache rows from `first_pos` on: the bounds that cover
+  /// them are stale. Appends past the covered keys leave the bounds untouched;
+  /// a rewrite below them (regenerated turn, rejected draft) pools them again.
+  void NoteDenseKvWrite(std::uint32_t layer, std::uint32_t first_pos) noexcept {
+    if (sparse_enabled && layer < sparse_pooled_end.size())
+      sparse_pooled_end[layer] = std::min(sparse_pooled_end[layer], first_pos);
+  }
   float* d_kv_cache{nullptr};
   // Mirrors of the live recurrent buffers (see BeginRecurrentWrite); reassigned
   // whenever the live buffer changes, so snapshots and resets read and write

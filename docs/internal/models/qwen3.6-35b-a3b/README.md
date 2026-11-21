@@ -156,6 +156,84 @@ On a 64 GB machine, four 131K sessions of Q4_K_M with DFlash2 and the
 8-bit KV cache fit in 42 GiB; see
 [Benchmarks](BENCHMARKS.md#a-64-gb-machine-gmktec-evo-x2).
 
+### Block-sparse attention (opt-in)
+
+`STRYCAST_SPARSE_ATTN=1` (also `on`, `true`, `yes`; `0`, `off`, `false`, `no` or
+unset disable it; any other value is refused at startup) makes the
+full-attention layers read only a selection of the cached keys, in prefill and
+in decode (including the rows the drafter's verification passes through). Each
+query tile attends to the first `STRYCAST_SPARSE_SINK` blocks of 64 keys
+(default 2), the last `STRYCAST_SPARSE_LOCAL` blocks (32) and the older blocks
+whose per-channel key min/max bound the tile's mean query best (Quest):
+`STRYCAST_SPARSE_TOPK` (256) in prefill, `STRYCAST_SPARSE_DECODE_TOPK` (512) in
+decode. The cost then stops growing with depth. It is training-free and
+**approximate**: greedy output is no longer byte-identical to the dense
+kernels, and two identical greedy requests can differ beyond ~60k tokens. The
+default stays exact (dense) with the variable unset.
+
+Where it applies:
+
+- **Prefill** chunks whose visible context exceeds
+  `STRYCAST_SPARSE_MIN_CONTEXT` (32768 keys, near the break-even measured
+  below). The last `STRYCAST_SPARSE_DENSE_TAIL` rows (1024) of a prompt run
+  apart and dense: the question that follows a long document has to find
+  things anywhere in it, and a selection made from a tile's mean query does not
+  reliably find them (24 numeric lookups scored 12-16/24 without the tail). A
+  prompt shorter than the tail is dense.
+- **Decode and verification rows**, from `STRYCAST_SPARSE_DECODE_MIN_CONTEXT`
+  (32768 keys), switchable on its own with `STRYCAST_SPARSE_DECODE=0`. Up to 32
+  rows share one selection chosen from their mean query, then run the
+  matrix-core decode kernel over the selected blocks. Rows are no longer
+  independent of their neighbours: greedy output with and without the drafter
+  may differ.
+- Only the 16 query / 2 KV head shape of this model; FP16 KV cache only
+  (disabled with `--kv-cache q8_0`); context <= 262144. Other Qwen shapes stay
+  dense.
+- The per-layer key bounds are rebuilt lazily from the cache. A snapshot
+  restore or `Reset()` invalidates them, and so does any dense route that
+  writes cache rows below the pooled keys (regenerated turn, rejected draft,
+  dense tail).
+- Memory: the pooled bounds cost about 80 MiB per session at 262144 tokens
+  (10 attention layers x 2 KV heads x 4096 blocks x 1 KiB). Account for it
+  when sizing `--sessions`.
+- Kernels and selection are adapted from mikealanni/gufo (MIT); see NOTICE.
+
+Measured on Strix Halo (gfx1151), Q4_K_XL with DFlash2, one session of 262144,
+one request at a time, source code as prompt (the first request of a size is
+slower, so the rows below are warm). Prefill tok/s, dense vs sparse with the defaults above:
+
+| Prompt tokens | Dense | Sparse |
+|---:|---:|---:|
+| 36 175 | 1914 | 1870 |
+| 46 693 | 1722 | 1789 |
+| 61 855 | 1525 | 1678 |
+| 77 596 | 1385 | 1619 |
+| 157 125 | 703 | 1363 |
+
+The 157 125-token row is a single cold run, sparse with the earlier threshold of
+8192; the other rows are the mean of two warm runs.
+
+Below 32768 keys the two are the same code. At 7k-23k tokens the output of the
+sparse build is byte-identical to the dense one with the default threshold;
+with a lower threshold (8192) sparse prefill was 10-25 % slower up to ~40k
+tokens, which is why the default is higher. Decode: 61 tok/s dense and
+56-62 sparse at 36-47k, 45 vs 50 at 157k.
+
+Quality, dense vs sparse with the defaults (same prompts, greedy):
+
+- Needle grid, one needle at 10/50/90 % depth, prompts of 28k, 56k, 114k and
+  178k tokens: 12/12 dense, 12/12 sparse.
+- 24 numeric constants asked one by one after ~110k tokens of code: 24/24
+  sparse (dense 24/24 in the earlier runs of that test).
+- Multi-turn session, 8 turns of ~20k tokens (up to 171k tokens) with a
+  question about an earlier chunk each turn, continuation cache in use: 12/12
+  dense, 12/12 sparse. At 171k tokens the last turn took 37 s dense and 17 s
+  sparse. The questions about the first chunk happened to name the same
+  constant every turn, so that part of the test is weak.
+- Not measured: a standard long-context suite such as RULER, and workloads
+  that need many facts from many places at once. Use `STRYCAST_SPARSE_ATTN=0`
+  if you see degradation.
+
 ### 8-bit KV cache
 
 `gufo serve llm --kv-cache q8_0` stores the attention KV cache in the ggml

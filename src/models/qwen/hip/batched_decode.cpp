@@ -419,6 +419,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
         const bool use_split_k = detail::IsSplitKDecodeAttentionSupported(
             static_cast<std::size_t>(position) + 1, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim);
+        state_arena.NoteDenseKvWrite(attention_layer, position);
         LaunchAttention(query, key, value, gate, state_arena.d_kv_cache,
                         OffsetIfPresent(state_arena.d_kv_cache, total_k),
                         state_arena.d_attention_kv_f16,
@@ -793,17 +794,37 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 reinterpret_cast<float*>(scratch.decode.weight_bf16.data()),
                 sequence_size * attention_scratch.size()};
           }
-          LaunchCausalDecodeAttention(
-              (scratch.attention.q.data() + offset * attention_size),
-              (scratch.ssm.gate.data() + offset * attention_size),
-              state_arena.d_kv_cache,
-              OffsetIfPresent(state_arena.d_kv_cache, total_k),
-              state_arena.d_attention_kv_f16, state_arena.AttentionVPlane(),
-              (scratch.ssm.out.data() + offset * attention_size),
-              attention_layer, start_pos, sequence_size,
-              state_arena.GetMaxContext(), config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, arena_.stream,
-              attention_scratch, state_arena.UsesQ8AttentionKv());
+          const bool sparse_rows =
+              state_arena.sparse_enabled && !state_arena.sparse_suspended &&
+              state_arena.sparse_config.decode_enabled &&
+              !state_arena.UsesQ8AttentionKv() &&
+              static_cast<std::size_t>(start_pos) + sequence_size >
+                  state_arena.sparse_config.decode_min_context &&
+              LaunchQwenSparseDecodeAttention(
+                  (scratch.attention.q.data() + offset * attention_size),
+                  (scratch.ssm.gate.data() + offset * attention_size),
+                  state_arena.d_attention_kv_f16, state_arena.AttentionVPlane(),
+                  (scratch.ssm.out.data() + offset * attention_size),
+                  state_arena.d_sparse_pooled, state_arena.d_sparse_lists,
+                  &state_arena.sparse_pooled_end[attention_layer],
+                  attention_layer, start_pos, sequence_size,
+                  state_arena.GetMaxContext(), config.num_attention_heads,
+                  config.num_key_value_heads, config.head_dim,
+                  state_arena.sparse_config, arena_.stream, attention_scratch);
+          if (!sparse_rows)
+            state_arena.NoteDenseKvWrite(attention_layer, start_pos);
+          if (!sparse_rows)
+            LaunchCausalDecodeAttention(
+                (scratch.attention.q.data() + offset * attention_size),
+                (scratch.ssm.gate.data() + offset * attention_size),
+                state_arena.d_kv_cache,
+                OffsetIfPresent(state_arena.d_kv_cache, total_k),
+                state_arena.d_attention_kv_f16, state_arena.AttentionVPlane(),
+                (scratch.ssm.out.data() + offset * attention_size),
+                attention_layer, start_pos, sequence_size,
+                state_arena.GetMaxContext(), config.num_attention_heads,
+                config.num_key_value_heads, config.head_dim, arena_.stream,
+                attention_scratch, state_arena.UsesQ8AttentionKv());
         } else {
           for (std::size_t row = 0; row < sequence_size; ++row) {
             float* const query =
@@ -816,6 +837,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        config.num_key_value_heads, config.head_dim,
                        config.rotary_dim, position, config.rope_theta,
                        arena_.stream, item.executor->vision_input_.rope());
+            state_arena.NoteDenseKvWrite(attention_layer, position);
             LaunchAttention(
                 query, key,
                 (scratch.attention.v.data() + offset * kv_size) + row * kv_size,

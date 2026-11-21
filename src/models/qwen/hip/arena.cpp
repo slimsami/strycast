@@ -2,12 +2,15 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <gufo/ext/experimental/hip_utils.hpp>
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -570,6 +573,24 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
   return GetMemoryUsage().request_state_bytes - unused;
 }
 
+namespace {
+// STRYCAST_SPARSE_ATTN: 1/on/true/yes enable, 0/off/false/no/empty disable.
+// Anything else is refused as a mistake rather than read as "enabled".
+bool SparseAttentionRequested() {
+  const char* value = std::getenv("STRYCAST_SPARSE_ATTN");
+  if (value == nullptr)
+    return false;
+  const std::string_view text(value);
+  if (text == "1" || text == "on" || text == "true" || text == "yes")
+    return true;
+  if (text.empty() || text == "0" || text == "off" || text == "false" ||
+      text == "no")
+    return false;
+  throw std::invalid_argument(
+      "STRYCAST_SPARSE_ATTN must be 0/1/on/off/true/false");
+}
+}  // namespace
+
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
     std::uint32_t valid_context) {
   if (valid_context > max_context_) {
@@ -667,6 +688,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
 }
 
 void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
+  InvalidateSparseAttention();
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
   const std::size_t conv_elements =
@@ -730,6 +752,7 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
 void QwenGpuArena::RestoreCompactSnapshot(
     std::span<const std::uint8_t> payload,
     std::uint32_t expected_valid_context) {
+  InvalidateSparseAttention();
   const auto layout = ParseCompactSnapshotLayout(payload);
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
@@ -895,6 +918,49 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
     }
 
+    // Opt-in and approximate; only the 16 query / 2 KV head shape of
+    // Qwen3.6-35B-A3B is measured, the other Qwen shapes stay dense.
+    if (SparseAttentionRequested() && config_.num_attention_heads == 16 &&
+        config_.num_key_value_heads == 2 && policy_.UsesFp16AttentionKv() &&
+        max_context_ <= 262144) {
+      const auto read = [](const char* name, std::uint32_t fallback) {
+        const char* value = std::getenv(name);
+        return value != nullptr
+                   ? static_cast<std::uint32_t>(std::max(0, std::atoi(value)))
+                   : fallback;
+      };
+      sparse_config.sink_blocks = read("STRYCAST_SPARSE_SINK", 2);
+      sparse_config.local_blocks = read("STRYCAST_SPARSE_LOCAL", 32);
+      sparse_config.top_blocks = read("STRYCAST_SPARSE_TOPK", 256);
+      sparse_config.min_context = read("STRYCAST_SPARSE_MIN_CONTEXT", 32768);
+      sparse_config.decode_min_context =
+          read("STRYCAST_SPARSE_DECODE_MIN_CONTEXT", 32768);
+      sparse_config.decode_top_blocks =
+          read("STRYCAST_SPARSE_DECODE_TOPK", 512);
+      sparse_config.decode_enabled = read("STRYCAST_SPARSE_DECODE", 1) != 0;
+      dense_tail_rows = read("STRYCAST_SPARSE_DENSE_TAIL", 1024);
+      HIP_CHECK(hipMalloc(&d_sparse_pooled,
+                          SparseAttentionPooledBytes(
+                              config_.FullAttentionLayerCount(),
+                              config_.num_key_value_heads, max_context_)));
+      HIP_CHECK(hipMalloc(
+          &d_sparse_lists,
+          SparseAttentionListInts(max_batch_, config_.num_key_value_heads,
+                                  sparse_config) *
+              sizeof(std::int32_t)));
+      sparse_pooled_end.assign(config_.FullAttentionLayerCount(), 0u);
+      sparse_enabled = true;
+      std::fprintf(
+          stderr,
+          "[strycast] block-sparse prefill attention: sink %u local %u "
+          "top %u blocks of 64, prefill from %u keys, decode %s from %u "
+          "keys (top %u)\n",
+          sparse_config.sink_blocks, sparse_config.local_blocks,
+          sparse_config.top_blocks, sparse_config.min_context,
+          sparse_config.decode_enabled ? "on" : "off",
+          sparse_config.decode_min_context, sparse_config.decode_top_blocks);
+    }
+
     const std::size_t total_conv =
         num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
     HIP_CHECK(hipMalloc(&d_ssm_conv_buffers_[0], total_conv * sizeof(float)));
@@ -1042,6 +1108,12 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_alpha_beta = other.d_ssm_alpha_beta;
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
+  d_sparse_pooled = other.d_sparse_pooled;
+  d_sparse_lists = other.d_sparse_lists;
+  sparse_pooled_end = std::move(other.sparse_pooled_end);
+  sparse_config = other.sparse_config;
+  sparse_enabled = other.sparse_enabled;
+  dense_tail_rows = other.dense_tail_rows;
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1091,6 +1163,9 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_alpha_beta = nullptr;
   other.d_logits = nullptr;
   other.d_attention_kv_f16 = nullptr;
+  other.d_sparse_pooled = nullptr;
+  other.d_sparse_lists = nullptr;
+  other.sparse_enabled = false;
   other.d_kv_cache = nullptr;
   other.d_ssm_conv_state = nullptr;
   other.d_ssm_deltanet_state = nullptr;
@@ -1148,6 +1223,12 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_alpha_beta = other.d_ssm_alpha_beta;
     d_logits = other.d_logits;
     d_attention_kv_f16 = other.d_attention_kv_f16;
+    d_sparse_pooled = other.d_sparse_pooled;
+    d_sparse_lists = other.d_sparse_lists;
+    sparse_pooled_end = std::move(other.sparse_pooled_end);
+    sparse_config = other.sparse_config;
+    sparse_enabled = other.sparse_enabled;
+    dense_tail_rows = other.dense_tail_rows;
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1197,6 +1278,9 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_alpha_beta = nullptr;
     other.d_logits = nullptr;
     other.d_attention_kv_f16 = nullptr;
+    other.d_sparse_pooled = nullptr;
+    other.d_sparse_lists = nullptr;
+    other.sparse_enabled = false;
     other.d_kv_cache = nullptr;
     other.d_ssm_conv_state = nullptr;
     other.d_ssm_deltanet_state = nullptr;
@@ -1229,6 +1313,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
 }
 
 void QwenGpuArena::Reset() {
+  InvalidateSparseAttention();
   const std::size_t num_layers = config_.SsmLayerCount();
   const std::size_t total_conv =
       num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
@@ -1305,6 +1390,14 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_logits));
   if (d_attention_kv_f16 != nullptr)
     LogCleanupError(hipFree(d_attention_kv_f16));
+  if (d_sparse_pooled != nullptr) {
+    LogCleanupError(hipFree(d_sparse_pooled));
+    d_sparse_pooled = nullptr;
+  }
+  if (d_sparse_lists != nullptr) {
+    LogCleanupError(hipFree(d_sparse_lists));
+    d_sparse_lists = nullptr;
+  }
   if (d_target_layer_features != nullptr) {
     LogCleanupError(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
