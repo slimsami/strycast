@@ -289,14 +289,24 @@ request decode rates.
 Same pp2048 mixed/repetitive prompts as single-user d0, tg128, context 4096
 per user. Every session is prefilled before timed decoding.
 
+The repetitive columns give each user its own prompt: eight passages from the
+same generator, rotated so that no two users in a batch share one, and C1 is
+the median over all eight. Gufo (Strycast `63a628c4`) and llama.cpp were
+measured on November 21, 2026. Until then every user sent the same prompt.
+Identical greedy requests decode in step and read the same experts. That
+made Gufo's 2-8 user rows 4-34% faster than with distinct prompts and
+llama.cpp's DFlash2 rows 6-43% faster, while llama.cpp's MTP rows moved
+between -19% and +20%. It also let one Gufo request that drafted before the
+others joined move a whole run between levels.
+
 <!-- bench:multi-dflash2-q4 -->
 | Qwen35B-A3B Q4 DFlash2<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 81.69 | 71.29 | +14.6% | 217.25 | 109.64 | +98.1% |
-| 2 | 117.59 | 97.96 | +20.0% | 205.59 | 151.40 | +35.8% |
-| 4 | 165.17 | 130.69 | +26.4% | 232.92 | 163.99 | +42.0% |
-| 6 | 174.57 | 152.11 | +14.8% | 242.43 | 199.36 | +21.6% |
-| 8 | 192.35 | 166.10 | +15.8% | 269.74 | 227.83 | +18.4% |
+| 1 | 81.69 | 71.29 | +14.6% | 234.98 | 101.44 | +131.6% |
+| 2 | 117.59 | 97.96 | +20.0% | 191.27 | 127.37 | +50.2% |
+| 4 | 165.17 | 130.69 | +26.4% | 207.54 | 137.78 | +50.6% |
+| 6 | 174.57 | 152.11 | +14.8% | 201.57 | 186.39 | +8.1% |
+| 8 | 192.35 | 166.10 | +15.8% | 226.28 | 164.93 | +37.2% |
 <!-- /bench -->
 
 ![Multiple users, DFlash2](artifacts/charts/multi-dflash2-q4.svg)
@@ -306,11 +316,11 @@ per user. Every session is prefilled before timed decoding.
 <!-- bench:multi-dflash2-q6 -->
 | Qwen35B-A3B Q6 DFlash2<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 72.20 | 67.80 | +6.5% | 187.44 | 99.51 | +88.4% |
-| 2 | 107.87 | 87.30 | +23.6% | 172.63 | 133.80 | +29.0% |
-| 4 | 140.62 | 123.51 | +13.9% | 202.34 | 156.25 | +29.5% |
-| 6 | 147.54 | 148.31 | -0.5% | 205.90 | 186.66 | +10.3% |
-| 8 | 161.70 | 158.16 | +2.2% | 224.75 | 207.36 | +8.4% |
+| 1 | 72.20 | 67.80 | +6.5% | 202.03 | 91.12 | +121.7% |
+| 2 | 107.87 | 87.30 | +23.6% | 165.41 | 114.57 | +44.4% |
+| 4 | 140.62 | 123.51 | +13.9% | 175.99 | 144.76 | +21.6% |
+| 6 | 147.54 | 148.31 | -0.5% | 182.96 | 148.17 | +23.5% |
+| 8 | 161.70 | 158.16 | +2.2% | 191.31 | 157.41 | +21.5% |
 <!-- /bench -->
 
 ![Multiple users, DFlash2](artifacts/charts/multi-dflash2-q6.svg)
@@ -320,11 +330,11 @@ per user. Every session is prefilled before timed decoding.
 <!-- bench:multi-dflash2-q8 -->
 | Qwen35B-A3B Q8 DFlash2<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 69.53 | 62.75 | +10.8% | 175.51 | 89.99 | +95.0% |
-| 2 | 112.33 | 81.50 | +37.8% | 170.28 | 142.68 | +19.3% |
-| 4 | 152.16 | 113.51 | +34.0% | 190.93 | 147.69 | +29.3% |
-| 6 | 162.27 | 126.99 | +27.8% | 215.27 | 173.99 | +23.7% |
-| 8 | 181.81 | 147.45 | +23.3% | 242.49 | 189.30 | +28.1% |
+| 1 | 69.53 | 62.75 | +10.8% | 188.07 | 85.30 | +120.5% |
+| 2 | 112.33 | 81.50 | +37.8% | 153.33 | 99.66 | +53.9% |
+| 4 | 152.16 | 113.51 | +34.0% | 167.22 | 126.25 | +32.5% |
+| 6 | 162.27 | 126.99 | +27.8% | 160.54 | 138.45 | +16.0% |
+| 8 | 181.81 | 147.45 | +23.3% | 187.25 | 137.26 | +36.4% |
 <!-- /bench -->
 
 ![Multiple users, DFlash2](artifacts/charts/multi-dflash2-q8.svg)
@@ -334,11 +344,11 @@ per user. Every session is prefilled before timed decoding.
 <!-- bench:multi-dflash2-q4km -->
 | Qwen35B-A3B Q4_K_M DFlash2<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 80.86 | 81.52 | -0.8% | 233.39 | 116.07 | +101.1% |
-| 2 | 136.75 | 100.15 | +36.5% | 237.77 | 127.96 | +85.8% |
-| 4 | 173.05 | 134.69 | +28.5% | 234.26 | 181.30 | +29.2% |
-| 6 | 180.01 | 165.46 | +8.8% | 245.09 | 216.98 | +13.0% |
-| 8 | 198.46 | 166.60 | +19.1% | 279.86 | 231.36 | +21.0% |
+| 1 | 80.86 | 81.52 | -0.8% | 248.37 | 106.00 | +134.3% |
+| 2 | 136.75 | 100.15 | +36.5% | 206.64 | 120.97 | +70.8% |
+| 4 | 173.05 | 134.69 | +28.5% | 211.65 | 159.36 | +32.8% |
+| 6 | 180.01 | 165.46 | +8.8% | 212.74 | 156.75 | +35.7% |
+| 8 | 198.46 | 166.60 | +19.1% | 225.38 | 202.94 | +11.1% |
 <!-- /bench -->
 
 ![Multiple users, DFlash2](artifacts/charts/multi-dflash2-q4km.svg)
@@ -350,11 +360,11 @@ Same prompts and method as the DFlash2 table.
 <!-- bench:multi-mtp-q4 -->
 | Qwen35B-A3B Q4 MTP<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 79.45 | 71.01 | +11.9% | 104.99 | 106.69 | -1.6% |
-| 2 | 125.05 | 96.44 | +29.7% | 140.71 | 116.20 | +21.1% |
-| 4 | 159.30 | 130.00 | +22.5% | 164.00 | 125.09 | +31.1% |
-| 6 | 203.46 | 151.92 | +33.9% | 194.53 | 134.24 | +44.9% |
-| 8 | 228.17 | 171.86 | +32.8% | 227.76 | 146.10 | +55.9% |
+| 1 | 79.45 | 71.01 | +11.9% | 106.35 | 104.63 | +1.6% |
+| 2 | 125.05 | 96.44 | +29.7% | 129.93 | 142.79 | -9.0% |
+| 4 | 159.30 | 130.00 | +22.5% | 143.02 | 126.44 | +13.1% |
+| 6 | 203.46 | 151.92 | +33.9% | 172.36 | 147.51 | +16.8% |
+| 8 | 228.17 | 171.86 | +32.8% | 193.34 | 153.02 | +26.3% |
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp-q4.svg)
@@ -364,11 +374,11 @@ Same prompts and method as the DFlash2 table.
 <!-- bench:multi-mtp-q6 -->
 | Qwen35B-A3B Q6 MTP<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 70.11 | 59.63 | +17.6% | 95.90 | 95.81 | +0.1% |
-| 2 | 105.91 | 92.55 | +14.4% | 121.30 | 100.17 | +21.1% |
-| 4 | 143.70 | 110.24 | +30.4% | 142.73 | 128.68 | +10.9% |
-| 6 | 175.70 | 136.14 | +29.1% | 175.47 | 113.82 | +54.2% |
-| 8 | 196.88 | 143.40 | +37.3% | 196.99 | 134.93 | +46.0% |
+| 1 | 70.11 | 59.63 | +17.6% | 97.23 | 96.69 | +0.6% |
+| 2 | 105.91 | 92.55 | +14.4% | 117.09 | 106.27 | +10.2% |
+| 4 | 143.70 | 110.24 | +30.4% | 128.05 | 107.34 | +19.3% |
+| 6 | 175.70 | 136.14 | +29.1% | 152.13 | 129.86 | +17.1% |
+| 8 | 196.88 | 143.40 | +37.3% | 168.84 | 126.85 | +33.1% |
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp-q6.svg)
@@ -378,11 +388,11 @@ Same prompts and method as the DFlash2 table.
 <!-- bench:multi-mtp-q8 -->
 | Qwen35B-A3B Q8 MTP<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 63.44 | 59.64 | +6.4% | 87.42 | 88.41 | -1.1% |
-| 2 | 104.46 | 81.48 | +28.2% | 119.86 | 91.26 | +31.3% |
-| 4 | 144.59 | 107.25 | +34.8% | 144.56 | 107.06 | +35.0% |
-| 6 | 182.33 | 129.17 | +41.2% | 171.44 | 109.75 | +56.2% |
-| 8 | 211.34 | 144.96 | +45.8% | 199.68 | 126.52 | +57.8% |
+| 1 | 63.44 | 59.64 | +6.4% | 88.49 | 89.13 | -0.7% |
+| 2 | 104.46 | 81.48 | +28.2% | 106.56 | 112.75 | -5.5% |
+| 4 | 144.59 | 107.25 | +34.8% | 115.26 | 119.37 | -3.4% |
+| 6 | 182.33 | 129.17 | +41.2% | 139.95 | 129.97 | +7.7% |
+| 8 | 211.34 | 144.96 | +45.8% | 158.59 | 150.95 | +5.1% |
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp-q8.svg)

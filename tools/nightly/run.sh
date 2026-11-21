@@ -298,10 +298,12 @@ PY
   # (Ornith pp at 8K: 940 or 981 tok/s on one binary), so they are measured
   # twice more on the same prompts, and the best of the three counts. A mean
   # over other prompts (--repetitions) cannot recover a slow first run.
-  # Multi-user MTP tables are measured twice more too: their concurrent rows
-  # sit at one of three levels on one binary (35B Q8 repetition at 4 users:
-  # 144.5, 141.5 or 130.6 tok/s), depending on whether a request drafts before
-  # the others join the batch and so falls out of step with identical prompts.
+  # Multi-user MTP tables are measured twice more too. With identical prompts
+  # the users decode in step and share their experts' weight reads, so a
+  # request that drafts before the others join the batch falls out of step and
+  # slows the whole batch (35B Q8 repetition at 4 users: 144.5, 141.5 or
+  # 130.6 tok/s on one binary). The repetitive workload now gives each user its
+  # own prompt and holds within 3%; the mixed one still sends one prompt.
   python3 "$src/tools/nightly/compare_bench.py" --set-aside "$out/bench-retry.txt" "${groups[@]}" > /dev/null
   local index config table group pass passes
   measuring_again=1
