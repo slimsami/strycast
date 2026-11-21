@@ -134,3 +134,48 @@ reference server context was 35456 through 32K, 68224 at 64K and 133760 at
 Strycast `a53ec202` with the same benchmark driver; neither the reference
 recipes nor the driver changed before the Strycast cells were measured on
 November 9.
+
+## Serve-path gates (G4 / G5 / G8)
+
+Run 2026-11-20 by @brunobarbosaux-ai on the same Strix Halo behave as the
+Flint validation (gfx1151, 128 GB), against llama.cpp **b11804** (official
+ROCm release artifact, build `11804`, commit `c7fc50941`, tarball
+`sha256:552b8bc5…`) as the oracle. The served file is the three-shard
+UD-IQ4_XS (`rev 38bb39ee`) through llama-swap; the oracle loaded the same
+file, one model resident at a time.
+
+The envelope is the committed calibration
+`tools/gates/calibration/qwen38-flash-next-ud-iq4-xs-rev38bb39ee.json`
+(delta ≤ 0.95 / rank ≤ 6).
+
+| Gate | Result | Detail |
+| --- | --- | --- |
+| G4 (greedy divergence) | **PASS 8/8** | every fork lands at rank ≤ 3, delta ≤ 0.4343 |
+| G5 (sampling distribution, T1.0 / p0.95 / k20) | **PASS** | same support, same ordering, TV 0.0750 ≤ 0.25, 200 rows |
+| G8 (concurrency) | **PASS** | identical greedy outputs at 1, 2, 3 and 4 concurrent sessions |
+
+Reproduce (phase-split, one model resident at a time):
+
+```sh
+# oracle arm (freshly started server, same GGUF)
+python3 tools/gates/serve_gates.py g4 --engine oracle \
+  --base-url http://127.0.0.1:8098 --model fn-iq4xs-v30 \
+  --out /tmp/g4-oracle.json --prompts 8
+# serve arm reusing the oracle's trimmed prompts
+python3 tools/gates/serve_gates.py g4 --engine serve \
+  --base-url http://127.0.0.1:8005/v1 --model flash-next-iq4xs \
+  --out /tmp/g4-serve.json --prompts-file /tmp/g4-oracle.json
+python3 tools/gates/serve_gates.py g4-compare /tmp/g4-oracle.json /tmp/g4-serve.json \
+  --calibration tools/gates/calibration/qwen38-flash-next-ud-iq4-xs-rev38bb39ee.json
+```
+
+### Envelope cross-check (Dynamic 3.1 UD-IQ4_XS)
+
+The same oracle was used to re-derive the Dynamic 3.1 envelope with
+`g4-calibrate --coverage 0.97` on the four-shard V3.1 file. The flip rate
+reproduced the committed run almost exactly (25.48% vs 25.5%, 671 vs 651
+sampled positions), which confirms both runs measure the same file and
+corpus. The P97 tail differs across runs (0.507 here vs 0.717 committed),
+so the committed envelope (delta ≤ 0.75 / rank ≤ 5) is kept: the narrower
+one is not reproducible enough to tighten to. A serve arm for V3.1 needs
+the Dynamic 3.1 support that PR #67 adds; it will follow once that lands.
