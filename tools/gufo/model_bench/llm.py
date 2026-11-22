@@ -576,9 +576,20 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
         return
     matched_prompt = spec.get("prompt_tokens")
     prefill_first = bool(spec.get("prefill_first", False))
+    # One generated prompt per user instead of the same prompt for all: identical
+    # greedy requests decode in lockstep, so a row that runs ahead (a draft taken
+    # before the cohort is admitted) changes the batch's cost on its own.
+    # `distinct_prompts` is a count, not the table's top concurrency, so a one-user
+    # AR variant of the table still records the C1 hash of every prompt.
+    distinct_prompts = int(spec.get("distinct_prompts", 0))
+    per_user = distinct_prompts > 1
     if matched_prompt:
         task = spec["workload"]
-        case_ids = {f"synthetic_{task}_pp{matched_prompt}"}
+        if per_user and distinct_prompts < max(levels):
+            raise ValueError(f"{table.id}: distinct_prompts must cover the top concurrency")
+        case_names = ([f"synthetic_{task}_pp{matched_prompt}_u{index}" for index in range(distinct_prompts)]
+                      if per_user else [f"synthetic_{task}_pp{matched_prompt}"])
+        case_ids = set(case_names)
         cases: list[PromptCase] = []
         suite_bytes = b""
     else:
@@ -617,10 +628,15 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                 with server:
                     if matched_prompt:
                         tokenizer = Tokenizer(session, server.base_url, table.variant)
-                        prompt = turn_prompt(int(matched_prompt) - tokenizer.overhead,
-                                             tokenizer.ratio, task=task)
-                        cases = [PromptCase(next(iter(case_ids)), task, prompt)]
+                        # User 0 keeps the shared prompt's text.
+                        prompts = [turn_prompt(int(matched_prompt) - tokenizer.overhead,
+                                               tokenizer.ratio, task=task, repetition=index)
+                                   for index in range(len(case_names))]
+                        prompt = prompts[0]
+                        cases = [PromptCase(name, task, text) for name, text in zip(case_names, prompts)]
                         suite_bytes = json.dumps(
+                            {"recipe": "single-user-d0", "task": task, "prompts": prompts}
+                            if per_user else
                             {"recipe": "single-user-d0", "task": task, "prompt": prompt},
                             sort_keys=True).encode()
                         if (prefill_first and users > 1 and session.target == "gufo"
@@ -639,7 +655,8 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         repetitions=session.reps(spec), timeout_seconds=REQUEST_TIMEOUT,
                         fingerprint=session.fingerprint or {}, source_revision=session.source["revision"],
                         source_dirty=session.source["dirty"], suite_bytes=suite_bytes,
-                        corpus_layout=spec.get("corpus_layout", "distinct"), endpoint_profile=session.profile,
+                        corpus_layout=("distinct" if per_user else spec.get("corpus_layout", "distinct")),
+                        endpoint_profile=session.profile,
                         cache_prompt=(True if prefill_first else
                                       (False if not spec.get("cache_prompt", False) else None)),
                         prefill_first=prefill_first,
@@ -691,6 +708,9 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                     "tokensPerWord": tokenizer.ratio,
                     "promptSha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 }
+                if per_user:
+                    report["workload"]["promptGenerator"]["promptsPerUser"] = [
+                        hashlib.sha256(case.text.encode()).hexdigest() for case in cases]
                 result["promptPreparation"] = (
                     "C1 checkpoint followed by concurrent preparation"
                     if prefill_first and users > 1 and session.target == "gufo"

@@ -33,10 +33,12 @@ promotion to `main` is ready to merge in the morning. The host's launcher
    measured twice more on the same prompts and the best of the three counts,
    since each of its rows is a single sample and some rows sit at one of two
    levels from run to run (Ornith prefill at 8K: 940 or 981 tok/s on one
-   binary). Multi-user MTP tables are also measured twice more, since their
-   concurrent rows sit at one of three levels on one binary (35B Q8
-   repetition at 4 users: 144.5, 141.5 or 130.6 tok/s), depending on whether
-   one request drafts before the others join the batch. An artifact a later
+   binary). Multi-user MTP tables are also measured twice more: when every
+   user sends the same prompt, their rows decode in step, and a request that
+   drafts before the others join the batch moves the batch to a slower level
+   (35B Q8 at 4 users: 144.5, 141.5 or 130.6 tok/s on one binary). The 35B
+   repetitive workload now gives each user its own prompt, which holds within
+   3%; the mixed workload still sends one prompt to all. An artifact a later
    run does not write keeps an earlier measurement.
 
 Phases still pending at 05:45 are skipped, which fails the night, so the host
