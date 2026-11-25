@@ -7,6 +7,7 @@ add_library(gufo_qwen_kernels STATIC
   attention_decode_graph.hip
   attention_decode.hip
   attention_decode_verify_wave64.hip
+  attention_sparse.hip
   attention_tile.hip
   attention_wmma.hip
   attention_wmma_decode.hip

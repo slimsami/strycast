@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,8 @@
 #include <gufo/ext/families/qwen/vision/device_input.hpp>
 
 #include "src/families/qwen/hip_common/execution_policy.hpp"
+#include "src/families/qwen/hip_common/sparse_attention_plan.hpp"
+#include "src/families/qwen/kernels/ops/attention.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/families/qwen/kernels/ops/ssm.hpp"
 #include "src/models/qwen/hip/prompt_hidden_buffer.hpp"
@@ -407,6 +410,35 @@ public:
   // K and V planes of [layer][position][width], one of the two per policy.
   // Both point into kv_region_, backed as positions are written.
   void* d_attention_kv_f16{nullptr};
+  /// Opt-in block-sparse prefill attention (STRYCAST_SPARSE_ATTN): per-layer
+  /// key min/max bounds, per-tile block lists, and how many keys the bounds
+  /// of each full-attention layer already cover.
+  void* d_sparse_pooled{nullptr};
+  std::int32_t* d_sparse_lists{nullptr};
+  std::vector<std::uint32_t> sparse_pooled_end;
+  SparseAttentionConfig sparse_config{};
+  bool sparse_enabled{false};
+  /// Set while the last rows of a prompt run: the question that follows a long
+  /// document has to see all of it, so these rows use the dense kernels.
+  bool sparse_suspended{false};
+  /// Prompt rows kept dense at the end of a prefill
+  /// (constant, 1024).
+  std::uint32_t dense_tail_rows{1024};
+  /// End of the whole prompt being prefilled, when its prefill spans several
+  /// calls (set by the serving runner, 0 otherwise): the dense tail is counted
+  /// from it, so every piece agrees on which rows are the tail.
+  std::size_t sparse_prompt_end{0};
+  /// Cached rows changed under the bounds (restore, reset): pool again.
+  void InvalidateSparseAttention() noexcept {
+    std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
+  }
+  /// A dense route wrote cache rows from `first_pos` on: the bounds that cover
+  /// them are stale. Appends past the covered keys leave the bounds untouched;
+  /// a rewrite below them (regenerated turn, rejected draft) pools them again.
+  void NoteDenseKvWrite(std::uint32_t layer, std::uint32_t first_pos) noexcept {
+    if (sparse_enabled && layer < sparse_pooled_end.size())
+      sparse_pooled_end[layer] = std::min(sparse_pooled_end[layer], first_pos);
+  }
   float* d_kv_cache{nullptr};
   // Mirrors of the live recurrent buffers (see BeginRecurrentWrite); reassigned
   // whenever the live buffer changes, so snapshots and resets read and write
@@ -469,6 +501,11 @@ public:
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  /// Whether an arena of this shape runs the opt-in block-sparse attention
+  /// (STRYCAST_SPARSE_ATTN, measured on the 16 query / 2 KV head shape only).
+  [[nodiscard]] static bool SparseAttentionApplies(
+      const core::ModelConfig& config, std::uint32_t max_context,
+      QwenExecutionPolicy policy);
   [[nodiscard]] static std::size_t RecurrentStateBytes(
       const core::ModelConfig& config, QwenExecutionPolicy policy);
   /// The state of one arena the core allocates (mem::SessionState): the
@@ -699,6 +736,11 @@ public:
 
   [[nodiscard]] std::uint32_t GetMaxPromptBatch() const noexcept {
     return arena_.GetMaxBatch();
+  }
+  /// The whole prompt a multi-call prefill belongs to ends at `end` (0: no
+  /// such prompt). Block-sparse attention counts its dense tail from there.
+  void SetSparsePromptEnd(std::size_t end) noexcept {
+    arena_.sparse_prompt_end = end;
   }
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return arena_.GetMaxContext();
