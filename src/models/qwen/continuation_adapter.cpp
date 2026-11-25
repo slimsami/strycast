@@ -564,6 +564,10 @@ void ContinuationAdapter::BeginRestore(
     Check(hipStreamSynchronize(state.draft->executor_->stream_));
   if (state.mtp)
     Check(hipStreamSynchronize(state.mtp->executor_->stream_));
+  // The restore writes key rows straight into the attention cache
+  // (TransferRows) and bypasses RestoreSnapshot/Reset: the sparse-attention
+  // bounds still describe what this session held before. Pool them again.
+  state.executor->arena_.InvalidateSparseAttention();
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});

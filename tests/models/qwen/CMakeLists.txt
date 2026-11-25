@@ -70,6 +70,9 @@ add_qwen_cpu_test(qwen_fusion_route_test
 add_qwen_cpu_test(qwen_attention_policy_test
   tests/models/qwen/hip/attention_policy_test.cpp
   "cpu;models;qwen;hip;attention;dispatch")
+add_qwen_cpu_test(qwen_sparse_attention_plan_test
+  tests/models/qwen/hip/sparse_attention_plan_test.cpp
+  "cpu;models;qwen;hip;attention;sparse")
 add_qwen_cpu_test(qwen_gemm_route_test
   tests/models/qwen/gemm_route_test.cpp
   "cpu;models;qwen;gemm;dispatch")
@@ -120,6 +123,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_wmma_decode_ops_test
     tests/models/qwen/hip/attention/wmma_decode_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode")
+  add_qwen_hip_test(qwen_attention_sparse_ops_test
+    tests/models/qwen/hip/attention/sparse_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;prefill;decode;sparse")
   add_qwen_hip_test(qwen_attention_kv_q8_ops_test
     tests/models/qwen/hip/attention/kv_q8_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;prefill;kv-q8")

@@ -156,6 +156,104 @@ On a 64 GB machine, four 131K sessions of Q4_K_M with DFlash2 and the
 8-bit KV cache fit in 42 GiB; see
 [Benchmarks](BENCHMARKS.md#a-64-gb-machine-gmktec-evo-x2).
 
+### Block-sparse attention (opt-in)
+
+`STRYCAST_SPARSE_ATTN=1` (also `on`, `true`, `yes`; `0`, `off`, `false`, `no` or
+unset disable it; any other value is refused at startup) makes the
+full-attention layers read only a selection of the cached keys, in prefill and
+in decode (including the rows the drafter's verification passes through). Each
+query tile attends to the first 2 blocks of 64 keys, the last 32 blocks and the
+older blocks whose per-channel key min/max bound the tile's mean query best
+(Quest): 256 in prefill, 512 in decode. These sizes and the thresholds below
+are constants (`SparseAttentionConfig`), not settings; only the two switches
+`STRYCAST_SPARSE_ATTN` and `STRYCAST_SPARSE_DECODE` are read from the
+environment. The cost then stops growing with depth. It is training-free and
+**approximate**: greedy output is no longer byte-identical to the dense
+kernels. The default stays exact (dense) with the variable unset.
+
+Every row is routed by its position in the prompt, never by where the server
+happens to split the prefill, so the same prompt gives the same output whatever
+the pass size (`--prefill-chunk`), the checkpoint captures or an aligned cached
+prefix. For that, `gufo serve` keeps prefill passes and prompt checkpoints on
+multiples of 32 tokens while the switch is on (the query tile, as for
+Flash-Next's selection blocks). Two cases still differ from a cold prefill of
+the whole prompt: rows restored from a cached prefix keep the route they had
+when they were first computed (a previous turn's question ran as that turn's
+dense tail), and a continuation from a decoded frontier that is not on a
+32-token boundary computes its first partial tile on its own.
+
+The dense tail is counted from the end of the whole prompt, which the runner
+reads from the prompt context (`PreparePrompt` records the token count in it;
+`SetPromptContext` hands it back before the first `Prefill`). It cannot use
+`prompt.size()`: the pool hands `Prefill` spans cut at cache checkpoints, so
+on a cold server (periodic checkpoints are captured) the end of a span is not
+the end of the prompt, and the tail would start 1024 rows before a checkpoint
+instead of before the real end.
+
+Where it applies:
+
+- **Prefill** rows from position 32768 on (near the break-even measured
+  below); a chunk crossing it is split there. The last 1024 rows of the whole
+  prompt, from the 32-token boundary at or before them, run apart and dense,
+  however many passes the server prefills the prompt in: the question that
+  follows a long document has to find things anywhere in it, and a selection
+  made from a tile's mean query does not reliably find them (24 numeric lookups
+  scored 12-16/24 without the tail). A prompt shorter than the tail is dense.
+- **Decode and verification rows**, from position 32768 on (a verification
+  segment crossing it is split there), switchable on its own with
+  `STRYCAST_SPARSE_DECODE=0` (same strict values as the main switch). Up to 32
+  rows share one selection chosen from their mean query, then run the
+  matrix-core decode kernel over the selected blocks. Rows are no longer
+  independent of their neighbours: greedy output with and without the drafter
+  may differ.
+- Only the 16 query / 2 KV head shape of this model; FP16 KV cache only
+  (disabled with `--kv-cache q8_0`); context <= 262144. Other Qwen shapes stay
+  dense.
+- The per-layer key bounds are rebuilt lazily from the cache. A snapshot
+  restore, a prompt-cache restore or `Reset()` invalidates them, and so does
+  any dense route that writes cache rows below the pooled keys (regenerated
+  turn, rejected draft, dense tail).
+- Memory: the pooled bounds cost about 80 MiB per session at 262144 tokens
+  (10 attention layers x 2 KV heads x 4096 blocks x 1 KiB), counted in the
+  session memory estimate when the switch is on.
+- Kernels and selection are adapted from mikealanni/gufo (MIT); see NOTICE.
+
+Measured on Strix Halo (gfx1151), Q4_K_XL with DFlash2, one session of 262144,
+one request at a time, source code as prompt (the first request of a size is
+slower, so the rows below are warm). Prefill tok/s, dense vs sparse with the defaults above:
+
+| Prompt tokens | Dense | Sparse |
+|---:|---:|---:|
+| 36 175 | 1914 | 1870 |
+| 46 693 | 1722 | 1789 |
+| 61 855 | 1525 | 1678 |
+| 77 596 | 1385 | 1619 |
+| 157 125 | 703 | 1363 |
+
+The 157 125-token row is a single cold run, sparse with the earlier threshold of
+8192; the other rows are the mean of two warm runs.
+
+Below 32768 keys the two are the same code. At 7k-23k tokens the output of the
+sparse build is byte-identical to the dense one with the default threshold;
+with a lower threshold (8192) sparse prefill was 10-25 % slower up to ~40k
+tokens, which is why the default is higher. Decode: 61 tok/s dense and
+56-62 sparse at 36-47k, 45 vs 50 at 157k.
+
+Quality, dense vs sparse with the defaults (same prompts, greedy):
+
+- Needle grid, one needle at 10/50/90 % depth, prompts of 28k, 56k, 114k and
+  178k tokens: 12/12 dense, 12/12 sparse.
+- 24 numeric constants asked one by one after ~110k tokens of code: 24/24
+  sparse (dense 24/24 in the earlier runs of that test).
+- Multi-turn session, 8 turns of ~20k tokens (up to 171k tokens) with a
+  question about an earlier chunk each turn, continuation cache in use: 12/12
+  dense, 12/12 sparse. At 171k tokens the last turn took 37 s dense and 17 s
+  sparse. The questions about the first chunk happened to name the same
+  constant every turn, so that part of the test is weak.
+- Not measured: a standard long-context suite such as RULER, and workloads
+  that need many facts from many places at once. Use `STRYCAST_SPARSE_ATTN=0`
+  if you see degradation.
+
 ### 8-bit KV cache
 
 `gufo serve llm --kv-cache q8_0` stores the attention KV cache in the ggml
