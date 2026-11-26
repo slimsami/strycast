@@ -40,17 +40,23 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
+  kQ5_0 = 6,
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
+  kIQ3_XXS = 18,
   kIQ4_NL = 20,
   kIQ3_S = 21,
+  kIQ2_S = 22,
   kIQ4_XS = 23,
   kBF16 = 30,
+  kQ2_0 = 42,
 };
 
-/// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).
+/// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0, Q6_K,
+/// IQ4_XS, F16, BF16 or F32 rows).
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream);
@@ -234,6 +240,7 @@ void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
+
 /// Native wave64 launch, selected by W8A8Gemm for wide output projections.
 /// Resolve the kernel before serving, without executing a projection.
 hipError_t PrepareW8A8GemmWave64();
@@ -258,7 +265,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      const YarnRope& yarn = {});
+                      const YarnRope& yarn = {}, bool q6 = false);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -274,6 +281,11 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
                         hipStream_t stream);
 /// input_stride is in half elements; zero means k. Padded rows are supported
+/// DenseF16Gemm over Q6_K weights (k a multiple of 256): each K block's codes
+/// decoded to F16 with its two K16 scales, F16 activations, F32 output.
+bool DenseQ6F16Gemm(const void* w, const __half* x, float* out,
+                    std::size_t batch, std::size_t m, std::size_t k,
+                    hipStream_t stream);
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
@@ -311,7 +323,7 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream, PassCheckpoints checkpoints = {},
                      hipStream_t z_stream = nullptr,
-                     hipEvent_t z_start = nullptr);
+                     hipEvent_t z_start = nullptr, bool q6 = false);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
