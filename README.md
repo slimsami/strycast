@@ -33,6 +33,32 @@ Ornith 1.5 122B was contributed by [@lucasmcoleman](https://github.com/lucasmcol
 in [#12](https://github.com/slimsami/strycast/pull/12), formerly
 [gufo-org/gufo#735](https://github.com/gufo-org/gufo/pull/735).
 
+### Strix Point (gfx1150)
+
+Strycast also builds for Strix Point, the Ryzen AI 300 series with a Radeon
+880M or 890M (`gfx1150`). It is the same RDNA 3.5 GPU as Strix Halo with fewer
+compute units and a smaller register file, so it needs its own code objects:
+`-DCMAKE_HIP_ARCHITECTURES=gfx1150`, or `"gfx1151;gfx1150"` for one binary that
+runs on both ([build notes](docs/install.md#strix-point-gfx1150)). Release
+bundles are still gfx1151 only.
+
+Don't run a gfx1151 build on Strix Point with
+`HSA_OVERRIDE_GFX_VERSION=11.5.1`. Some kernels then work, but every gfx1151
+kernel that launches 1024 threads with more than 128 registers is rejected by
+the GPU (`HSA_STATUS_ERROR_INVALID_DISPATCH_PARAMETERS`); the Qwen3.8 27B dies
+on its first long prompt that way.
+
+Measured on a Radeon 890M (16 CUs, 96 GB DDR5-5600, 80 GiB GTT), greedy:
+
+| Model | Prefill 2K / 8K | Decode | Decode with DFlash2 |
+| --- | --- | --- | --- |
+| Qwen3.6 35B-A3B UD-Q4_K_XL | 1,196 / 1,246 tok/s | 24.4 tok/s | 40.8 tok/s |
+| Qwen3.8 27B UD-Q4_K_XL | 170 tok/s (2K) | 4.4 tok/s | 11.3 tok/s |
+
+On the 35B the gfx1150 build gives byte-identical answers to the gfx1151 code
+objects on the same GPU, at the same speed. Qwen3.8 Flash-Next does not fit in
+96 GB.
+
 ### Maintainers
 
 - [@slimsami](https://github.com/slimsami)

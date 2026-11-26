@@ -1,8 +1,9 @@
 # Install
 
-Gufo runs on Linux x86-64 with an AMD Strix Halo GPU (`gfx1151`). This page
-covers the container, the Debian package, Nix, a build from source and the
-Windows ZIP.
+Gufo runs on Linux x86-64 with an AMD Strix Halo GPU (`gfx1151`); Strycast
+also builds for Strix Point (`gfx1150`, [below](#strix-point-gfx1150)). This
+page covers the container, the Debian package, Nix, a build from source and
+the Windows ZIP.
 
 ## Prepare the host
 
@@ -114,6 +115,37 @@ cmake --install build/release
 
 Different compilers or math libraries can change results slightly; Gufo's
 published numbers use the Nix toolchain.
+
+## Strix Point (gfx1150)
+
+Strix Point (Ryzen AI 300 series, Radeon 880M/890M) is the same RDNA 3.5 GPU as
+Strix Halo with fewer compute units and two thirds of the registers per SIMD.
+The release bundles and the container hold gfx1151 code only, so build Gufo
+for it:
+
+- With Nix: `nix build .#gfx1150`. It uses the gfx1150 ROCm scope, whose
+  rocBLAS, hipBLASLt and rocSOLVER are not on the `gufo` Cachix cache, so the
+  first build compiles them (several hours).
+- Without Nix, follow [Build from source](#build-from-source) with AMD's ROCm
+  10.1 packages for the GPU, for example on Ubuntu `amdrocm-core-dev10.1-gfx1150`,
+  `amdrocm-blas-dev10.1`, `amdrocm-blas10.1-gfx1150`, `amdrocm-solver-dev10.1`,
+  `amdrocm-solver10.1-gfx1150` and `amdrocm-profiler-base10.1`, and configure
+  with:
+
+  ```sh
+  cmake --preset release -DCMAKE_PREFIX_PATH=/opt/rocm/core-10.1 \
+    -DCMAKE_HIP_COMPILER=/opt/rocm/core-10.1/lib/llvm/bin/clang++ \
+    -DCMAKE_HIP_ARCHITECTURES=gfx1150
+  ```
+
+  `-DCMAKE_HIP_ARCHITECTURES="gfx1151;gfx1150"` builds one binary for both
+  GPUs, at twice the GPU compile time.
+
+`gufo diagnose` reports `Detected AMD Strix Point GPU (gfx1150)`. Don't use
+`HSA_OVERRIDE_GFX_VERSION=11.5.1` with a gfx1151 build instead: gfx1151 kernels
+that launch 1024 threads with more than 128 registers fail on gfx1150 with
+`HSA_STATUS_ERROR_INVALID_DISPATCH_PARAMETERS`. Raise the GPU memory limit for
+large models (`ttm.pages_limit`; the kernel default is about half of RAM).
 
 ## Windows
 

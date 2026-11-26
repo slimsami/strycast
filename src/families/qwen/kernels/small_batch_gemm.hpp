@@ -9,6 +9,7 @@
 #include <limits>
 #include <type_traits>
 
+#include "src/core/hip/occupancy.hpp"
 #include "src/families/qwen/hip_common/quant_ops.hpp"
 
 namespace gufo::hip {
@@ -447,9 +448,10 @@ template<std::uint32_t WavesPerBlock, std::size_t Batch,
          bool DistributedOutput =
              kKQuantDistributedOutput<Batch, WType, HardwareWaveSize>,
          bool FusedSwiGLU = false, bool Ragged = false>
-__launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
-                                           ? MinWaves * 32 / HardwareWaveSize
-                                           : 1)) __global__
+__launch_bounds__(WavesPerBlock * 32,
+                  GUFO_MIN_WAVES_PER_SIMD(MinWaves * 32 / HardwareWaveSize > 0
+                                              ? MinWaves * 32 / HardwareWaveSize
+                                              : 1)) __global__
     void SmallBatchKQuantExactFp32GEMMKernel(const void* __restrict__ w,
                                              const float* __restrict__ x,
                                              float* __restrict__ y,

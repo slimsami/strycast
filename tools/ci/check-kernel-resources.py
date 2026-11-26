@@ -31,6 +31,10 @@ The allowances use the mangled kernel names. The Itanium ABI keeps these names
 the same across compilers. The tool removes the version from the rocPRIM
 inline namespace, so a baseline stays valid after a ROCm update.
 
+A binary built for several GPUs (CMAKE_HIP_ARCHITECTURES="gfx1151;gfx1150")
+holds one code object per GPU for each kernel. The tool checks one of them,
+--arch (default gfx1151, the GPU the allowances were made for).
+
 Compressed offload bundles (CCOB) need Python zstd or zlib. If they are not
 available, the tool uses clang-offload-bundler (--bundler, the HIP toolchain,
 or PATH).
@@ -239,7 +243,7 @@ def key(mangled: str) -> str:
     return re.sub(r"\d+ROCPRIM_\d+_NS", "ROCPRIM_NS", mangled)
 
 
-def binary_kernels(path: str, bundler: str | None) -> dict[str, dict]:
+def binary_kernels(path: str, bundler: str | None, arch: str = "gfx1151") -> dict[str, dict]:
     data = Path(path).read_bytes()
     sections = elf_sections(data)
     if ".hip_fatbin" not in sections:
@@ -252,17 +256,19 @@ def binary_kernels(path: str, bundler: str | None) -> dict[str, dict]:
         for triple, payload in bundle_entries(blob):
             if not triple.startswith(("hip", "hipv4")) or "amdgcn" not in triple or not payload:
                 continue
-            arch = triple.rsplit("-", 1)[-1]
+            target = triple.rsplit("-", 1)[-1]
+            if target.split(":", 1)[0] != arch:
+                continue
             for k in code_object_kernels(payload):
                 kernels[key(k[".name"])] = {
-                    "arch": arch,
+                    "arch": target,
                     "scratch": int(k.get(".private_segment_fixed_size", 0)),
                     "vgpr": int(k.get(".vgpr_count", 0)),
                     "vgpr_spill": int(k.get(".vgpr_spill_count", 0)),
                     "sgpr_spill": int(k.get(".sgpr_spill_count", 0)),
                 }
     if not kernels:
-        raise SystemExit(f"{path}: no AMDGPU kernels found")
+        raise SystemExit(f"{path}: no AMDGPU kernels for {arch} found")
     return kernels
 
 
@@ -351,6 +357,8 @@ def main() -> int:
     ap.add_argument("--write-baseline", help="write a JSON file that allows the current scratch of each kernel")
     ap.add_argument("--report", nargs="?", const="", help="list the kernels that use scratch (optional name filter)")
     ap.add_argument("--bundler", default=None, help="path of clang-offload-bundler, for compressed bundles")
+    ap.add_argument("--arch", default="gfx1151",
+                    help="GPU whose code objects to check, in a binary built for several (default gfx1151)")
     ap.add_argument("--note", default="", help="text that --write-baseline records in the file")
     ap.add_argument("--compare", metavar="BASE_BINARY", help="list the kernels that are worse than in BASE_BINARY")
     ap.add_argument("--known", metavar="BASE_BINARY",
@@ -358,11 +366,11 @@ def main() -> int:
     args = ap.parse_args()
 
     bundler = find_bundler(args.bundler)
-    kernels = binary_kernels(args.binary, bundler)
+    kernels = binary_kernels(args.binary, bundler, args.arch)
     using = {n: k for n, k in kernels.items() if k["scratch"] > 0}
 
     if args.compare:
-        return compare(binary_kernels(args.compare, bundler), kernels)
+        return compare(binary_kernels(args.compare, bundler, args.arch), kernels)
 
     if args.write_baseline:
         allow = {n: {"max_scratch": k["scratch"]} for n, k in sorted(using.items())}
@@ -384,7 +392,7 @@ def main() -> int:
         ap.error("one of --baseline, --write-baseline or --report is required")
     budget = json.loads(Path(args.baseline).read_text())
     allow = budget.get("allow", {})
-    known = binary_kernels(args.known, bundler) if args.known else None
+    known = binary_kernels(args.known, bundler, args.arch) if args.known else None
     bad, tolerated = over_budget(kernels, budget, known)
     stale = sorted(set(allow) - set(kernels))
     dm = demangle([n for n, _, _ in bad] + stale)

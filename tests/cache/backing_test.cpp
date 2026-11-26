@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "src/core/diagnostics/gpu_architecture.h"
 #include "src/core/hip/committed_backing.hpp"
 #include "src/core/hip/component_cache_resources.hpp"
 #include "src/core/hip/transfer_pool.hpp"
@@ -1199,7 +1200,8 @@ int main(int argc, char** argv) {
     assert(argc == 1);
   hipDeviceProp_t properties{};
   assert(hipGetDeviceProperties(&properties, 0) == hipSuccess);
-  assert(std::strncmp(properties.gcnArchName, "gfx1151", 7) == 0);
+  assert(!gufo::diagnostics::SupportedGpuArchitecture(properties.gcnArchName)
+              .empty());
   Backing();
   GroupedBacking();
   CheckpointLifetimes();

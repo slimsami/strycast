@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <sstream>
 
+#include "src/core/diagnostics/gpu_architecture.h"
 #include "src/core/platform/os_info.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -116,6 +117,9 @@ SystemInventory CollectSystemInventory(const LinuxSysfs& sysfs) {
         pci_view.find("1002:1588") != std::string_view::npos) {
       inv.gpu.architecture = "gfx1151";
       inv.gpu.availability = "available";
+    } else if (pci_view.find("1002:150e") != std::string_view::npos) {
+      inv.gpu.architecture = "gfx1150";
+      inv.gpu.availability = "available";
     } else {
       inv.gpu.architecture = primary_gpu.pci_id;
       inv.gpu.availability = "unsupported GPU (" + primary_gpu.pci_id + ")";
@@ -134,10 +138,11 @@ SystemInventory CollectSystemInventory(const LinuxSysfs& sysfs) {
       inv.gpu.compute_units =
           static_cast<std::uint32_t>(prop.multiProcessorCount);
 
-      // Normalize architecture to gfx1151
-      const std::string_view raw_view(prop.gcnArchName);
-      if (raw_view.find("gfx1151") != std::string_view::npos) {
-        inv.gpu.architecture = "gfx1151";
+      // Normalize the architecture, dropping feature flags such as ":xnack-".
+      const std::string_view supported =
+          SupportedGpuArchitecture(prop.gcnArchName);
+      if (!supported.empty()) {
+        inv.gpu.architecture = std::string(supported);
         inv.gpu.availability = "available";
       } else {
         inv.gpu.architecture = prop.gcnArchName;

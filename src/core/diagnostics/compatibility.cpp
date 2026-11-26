@@ -3,6 +3,8 @@
 #include <sstream>
 #include <string>
 
+#include "src/core/diagnostics/gpu_architecture.h"
+
 namespace gufo::diagnostics {
 
 namespace {
@@ -62,22 +64,22 @@ CompatibilityReport EvaluateCompatibility(const SystemInventory& inventory,
     report.items.push_back(std::move(platform_item));
   }
 
-  // 2. GPU Architecture Check (gfx1151)
+  // 2. GPU Architecture Check (gfx1151 or gfx1150)
   if (section == "all" || section == "gpu" || section == "inventory") {
     CompatibilityItem gpu_item;
     gpu_item.component = "gpu";
     gpu_item.detected_value = inventory.gpu.architecture;
-    gpu_item.required_value = "gfx1151";
+    gpu_item.required_value = std::string(kSupportedGpuArchitecturesText);
     gpu_item.evidence = inventory.gpu.source;
-    if (inventory.gpu.architecture == "gfx1151") {
+    if (IsSupportedGpuArchitecture(inventory.gpu.architecture)) {
       gpu_item.verdict = CompatibilityVerdict::kSupported;
       gpu_item.remediation_hint = "None";
     } else {
       gpu_item.verdict = CompatibilityVerdict::kUnsupported;
       gpu_item.remediation_hint =
-          "gufo requires AMD Strix Halo gfx1151 GPU (Radeon 8060S / "
-          "8050S). Detected: " +
-          inventory.gpu.architecture;
+          "gufo requires an AMD " +
+          std::string(kSupportedGpuArchitecturesText) +
+          " GPU. Detected: " + inventory.gpu.architecture;
       overall = CompatibilityVerdict::kUnsupported;
     }
     report.items.push_back(std::move(gpu_item));

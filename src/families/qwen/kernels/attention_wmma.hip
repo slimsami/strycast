@@ -67,6 +67,7 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/core/hip/occupancy.hpp"
 #include "src/families/qwen/hip_common/attention_policy.hpp"
 #include "src/families/qwen/kernels/kv_q8.hpp"
 #include "src/families/qwen/kernels/ops/attention.hpp"
@@ -661,7 +662,10 @@ template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads,
          std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false>
 // LLVM 24 otherwise uses 241 VGPRs for packed V, crossing the six-wave
 // allocation boundary. Keep six waves resident without changing the tiling.
-__launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
+__launch_bounds__(256,
+                  GUFO_MIN_WAVES_PER_SIMD((__clang_major__ >= 24 && kHeadMajor)
+                                              ? 6
+                                              : 2)) __global__
     void WmmaCausalAttention(const float* __restrict__ q,
                              const float* __restrict__ gate,
                              const __half* __restrict__ k_cache_f16,
