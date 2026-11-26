@@ -185,7 +185,7 @@ struct ggml_hip_unroll<1> {
 // crossbar (ds_bpermute). Only the transport differs, so sums stay bitwise.
 template<int offset>
 static __device__ __forceinline__ int xor_lane(int x) {
-#if defined(__gfx1151__)
+#if defined(__gfx1150__) || defined(__gfx1151__)
     if constexpr (offset < 16) {
         return __builtin_amdgcn_update_dpp(0, x, 0x160 | offset, 0xF, 0xF, false);
     } else if constexpr (offset == 16) {

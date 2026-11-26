@@ -16,6 +16,7 @@
 #include "src/core/diagnostics/bandwidth.h"
 #include "src/core/diagnostics/compatibility.h"
 #include "src/core/diagnostics/fingerprint.h"
+#include "src/core/diagnostics/gpu_architecture.h"
 #include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/diagnostics/system_inventory.h"
 
@@ -167,14 +168,17 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     check.details["pciId"] = inventory.gpu.pci_id;
     check.details["powerMode"] = inventory.gpu.power_mode;
 
-    if (inventory.gpu.architecture == "gfx1151") {
+    if (diagnostics::IsSupportedGpuArchitecture(inventory.gpu.architecture)) {
       check.status = diagnostics::DiagnosticStatus::kPass;
-      check.message = "Detected AMD Strix Halo GPU (gfx1151)";
+      check.message = "Detected " +
+                      std::string(diagnostics::GpuArchitectureFamily(
+                          inventory.gpu.architecture)) +
+                      " GPU (" + inventory.gpu.architecture + ")";
     } else {
       check.status = diagnostics::DiagnosticStatus::kFail;
-      check.message =
-          "Unsupported GPU architecture: expected gfx1151, detected " +
-          inventory.gpu.architecture;
+      check.message = "Unsupported GPU architecture: expected " +
+                      std::string(diagnostics::kSupportedGpuArchitecturesText) +
+                      ", detected " + inventory.gpu.architecture;
       report.AddError("Unsupported GPU architecture: " +
                       inventory.gpu.architecture);
     }

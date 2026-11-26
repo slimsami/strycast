@@ -49,7 +49,7 @@ __device__ __forceinline__ float Materialize(float v) {
 /// (ds_bpermute). Only the transport differs, so reductions stay bitwise;
 /// every lane must be active, as the shuffle's callers already require.
 __device__ __forceinline__ int XorLane(int v, int offset) {
-#if defined(__gfx1151__)
+#if defined(__gfx1150__) || defined(__gfx1151__)
   switch (offset) {
     case 1:
       return __builtin_amdgcn_update_dpp(0, v, 0x161, 0xF, 0xF, false);

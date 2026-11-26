@@ -22,6 +22,7 @@
 
 #include "src/cli/bench/kernel_bench.hpp"
 #include "src/core/diagnostics/fingerprint.h"
+#include "src/core/diagnostics/gpu_architecture.h"
 #include "src/core/diagnostics/system_inventory.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/model_config.hpp"
@@ -1029,9 +1030,11 @@ int Run(std::span<const char* const> args) {
   HIP_CHECK(hipGetDevice(&device));
   hipDeviceProp_t properties{};
   HIP_CHECK(hipGetDeviceProperties(&properties, device));
-  if (std::string_view(properties.gcnArchName).find("gfx1151") ==
-      std::string_view::npos) {
-    throw std::runtime_error("gufo-kernel-bench requires gfx1151");
+  if (gufo::diagnostics::SupportedGpuArchitecture(properties.gcnArchName)
+          .empty()) {
+    throw std::runtime_error(
+        "gufo-kernel-bench requires " +
+        std::string(gufo::diagnostics::kSupportedGpuArchitecturesText));
   }
 
   const auto inventory = gufo::diagnostics::CollectSystemInventory();

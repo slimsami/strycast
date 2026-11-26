@@ -64,6 +64,18 @@
         }
       );
 
+      # Strix Point (gfx1150): the same sources with gfx1150 code objects and
+      # the gfx1150 ROCm BLAS libraries. gufo.cachix.org holds only the gfx1151
+      # libraries, so the first build compiles rocBLAS/hipBLASLt for gfx1150.
+      gufoPackagesGfx1150 = forAllSystems (
+        system:
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix {
+          inherit revision;
+          rustToolchain = rustToolchains.${system};
+          rocmPackages = pkgs.${system}.rocmPackages.gfx1150;
+        }
+      );
+
       llamaReferences = forAllSystems (
         system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix {
           rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
@@ -703,6 +715,10 @@
         in
         {
           default = base;
+          # Strix Point (Radeon 880M/890M) build; see gufoPackagesGfx1150.
+          gfx1150 = gufoPackagesGfx1150.${system}.gufo.override {
+            hipArchitectures = [ "gfx1150" ];
+          };
           # Explicit qualification suites stay out of `nix flake check`.
           inherit (allChecks.${system}) h3-manifest h3-quality h3-ml-quality static-analysis;
           # Official artifacts select this output from a tagged source. The

@@ -83,13 +83,29 @@ set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
   "FFprobe executable used to validate generated media")
 
-# CPU-only builds exist for host checks; production targets gfx1151 only.
-option(ENGINE_ENABLE_HIP "Build the gfx1151 HIP backend" ON)
+# CPU-only builds exist for host checks; production targets gfx1151, and
+# gfx1150 builds are supported for Strix Point laptops and mini PCs.
+option(ENGINE_ENABLE_HIP "Build the gfx1150/gfx1151 HIP backend" ON)
 include(cmake/GufoExtensionDiscovery.cmake)
 gufo_discover_extensions()
-set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
-if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
-  message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
+# gfx1150 (Strix Point, Radeon 880M/890M) is the same RDNA 3.5 ISA as gfx1151
+# with a smaller register file (1024 instead of 1536 VGPR rows per SIMD), so the
+# kernels need their own code objects there: gfx1151 code that launches more
+# waves than the smaller file holds is rejected by the dispatcher. Both can be
+# built into one binary, e.g. -DCMAKE_HIP_ARCHITECTURES="gfx1151;gfx1150".
+set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architectures")
+set(GUFO_SUPPORTED_HIP_ARCHITECTURES gfx1150 gfx1151)
+if (ENGINE_ENABLE_HIP)
+  if (NOT CMAKE_HIP_ARCHITECTURES)
+    message(FATAL_ERROR "CMAKE_HIP_ARCHITECTURES is empty")
+  endif()
+  foreach(arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+    if (NOT arch IN_LIST GUFO_SUPPORTED_HIP_ARCHITECTURES)
+      message(FATAL_ERROR
+        "Unsupported HIP architecture ${arch}: Gufo kernels target "
+        "${GUFO_SUPPORTED_HIP_ARCHITECTURES}")
+    endif()
+  endforeach()
 endif()
 # Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH. As a
 # system prefix /opt/rocm is searched after CMAKE_PREFIX_PATH in the
@@ -1182,13 +1198,19 @@ endfunction()
     LABELS "cpu;tools;profiling")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
-  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
+  # gufo_diagnostics reports the built extensions, which only an executable defines.
+  target_sources(gpu_queues_test PRIVATE src/cli/extension_diagnostics.cpp)
+  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform gufo_core)
+  gufo_target_extensions(gpu_queues_test EXTENSIONS)
   add_test(NAME gpu_queues_test COMMAND gpu_queues_test)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
 
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
-  target_link_libraries(bandwidth_test PRIVATE gufo_diagnostics)
+  # gufo_diagnostics reports the built extensions, which only an executable defines.
+  target_sources(bandwidth_test PRIVATE src/cli/extension_diagnostics.cpp)
+  target_link_libraries(bandwidth_test PRIVATE gufo_diagnostics gufo_core)
+  gufo_target_extensions(bandwidth_test EXTENSIONS)
 
   add_test(NAME bandwidth_test COMMAND bandwidth_test)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")

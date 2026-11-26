@@ -21,6 +21,10 @@
   releaseVersion ? null,
   extensionsFromLock ? false,
   extensions ? [ ],
+  # GPU code objects to build. gfx1151 (Strix Halo) is the production target;
+  # gfx1150 (Strix Point) needs a ROCm scope with gfx1150 BLAS libraries too
+  # (the flake's `gfx1150` package).
+  hipArchitectures ? [ "gfx1151" ],
   revision,
   sourceRoot ? ../..,
 }:
@@ -141,6 +145,7 @@ stdenv.mkDerivation {
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
+    "-DCMAKE_HIP_ARCHITECTURES=${lib.concatStringsSep ";" hipArchitectures}"
   ] ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
   ++ lib.optional (extensions != [ ]) "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}";
 
@@ -206,7 +211,7 @@ stdenv.mkDerivation {
     };
     toolchain = {
       targetPlatform = "x86_64-linux";
-      targetGpu = "gfx1151";
+      targetGpu = lib.concatStringsSep ";" hipArchitectures;
       cxxCompiler = stdenv.cc.name;
       rocmVersion = rocmPackages.clr.version;
       hipClangVersion = rocmPackages.llvm.clang.version;
@@ -214,7 +219,7 @@ stdenv.mkDerivation {
   };
 
   meta = with lib; {
-    description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU)";
+    description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU) and Strix Point (gfx1150)";
     homepage = "https://github.com/gufo-org/gufo";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];
