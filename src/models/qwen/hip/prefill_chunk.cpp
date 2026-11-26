@@ -806,17 +806,40 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // below only applies RoPE in place and never touches the cache, so it
       // still needs the pack.
       const bool kv_already_written = fused_qknorm_rope_kv;
-      const bool wmma_attention = LaunchQwenWmmaAttention(
-          arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-          arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
-          arena_.d_attention_kv_f16, arena_.AttentionVPlane(), arena_.d_ssm_out,
-          attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
-          config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, arena_.stream,
-          /*lse_out=*/nullptr, /*key_begin=*/0,
-          /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
-          attention_workspace.up, output_first_row, arena_.UsesQ8AttentionKv());
-      if (wmma_attention) {
+      // Opt-in block-sparse route (STRYCAST_SPARSE_ATTN): FP16 cache already
+      // written by the fused kernel, whole chunk wanted (the dense launcher
+      // skips output tiles below output_first_row), deep enough to pay off.
+      const bool sparse_attention =
+          arena_.sparse_enabled && !arena_.sparse_suspended &&
+          kv_already_written && output_first_row == 0 &&
+          !arena_.UsesQ8AttentionKv() &&
+          visible_context > arena_.sparse_config.min_context &&
+          LaunchQwenSparseWmmaAttention(
+              arena_.d_q, arena_.d_ssm_gate, arena_.d_attention_kv_f16,
+              arena_.AttentionVPlane(), arena_.d_ssm_out,
+              arena_.d_sparse_pooled, arena_.d_sparse_lists,
+              &arena_.sparse_pooled_end[attn_layer_idx], attn_layer_idx,
+              start_pos, batch_size, arena_.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, arena_.sparse_config, arena_.stream);
+      if (!sparse_attention)
+        arena_.NoteDenseKvWrite(attn_layer_idx, start_pos);
+      const bool wmma_attention =
+          sparse_attention ||
+          LaunchQwenWmmaAttention(
+              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+              arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
+              arena_.d_attention_kv_f16, arena_.AttentionVPlane(),
+              arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
+              arena_.GetMaxContext(), config.num_attention_heads,
+              config.num_key_value_heads, config.head_dim, arena_.stream,
+              /*lse_out=*/nullptr, /*key_begin=*/0,
+              /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
+              attention_workspace.up, output_first_row,
+              arena_.UsesQ8AttentionKv());
+      if (sparse_attention) {
+        detail::EmitAttentionDispatch("prefill_sparse", "");
+      } else if (wmma_attention) {
         detail::EmitAttentionDispatch("prefill_wmma", "");
       } else if (arena_.UsesQ8AttentionKv()) {
         throw std::invalid_argument(

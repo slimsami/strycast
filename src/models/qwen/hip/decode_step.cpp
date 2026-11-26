@@ -240,7 +240,36 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
       // Softmax Attention + Gating. The 8-bit cache has only the split-K
       // matrix-core route.
-      if (use_split_k_decode || arena.UsesQ8AttentionKv()) {
+      // Opt-in block-sparse route (STRYCAST_SPARSE_ATTN): host position and
+      // host-side bound tracking, so never under graph capture (MoE decode is
+      // not captured; other shapes are refused by the launcher). A captured
+      // graph would replay a stale block selection, so fail loudly instead.
+      if (arena.sparse_enabled && arena.sparse_config.decode_enabled) {
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        HIP_CHECK(hipStreamIsCapturing(arena.stream, &capture_status));
+        if (capture_status != hipStreamCaptureStatusNone)
+          throw std::logic_error(
+              "block-sparse decode attention cannot run under graph capture");
+      }
+      const bool sparse_decode =
+          arena.sparse_enabled && !arena.sparse_suspended &&
+          arena.sparse_config.decode_enabled && use_split_k_decode &&
+          fused_qknorm_rope_kv && !arena.UsesQ8AttentionKv() &&
+          sequence_length > arena.sparse_config.decode_min_context &&
+          LaunchQwenSparseDecodeAttention(
+              attention_scratch.q.data(), ssm_scratch.gate.data(),
+              arena.d_attention_kv_f16, arena.AttentionVPlane(),
+              ssm_scratch.out.data(), arena.d_sparse_pooled,
+              arena.d_sparse_lists, &arena.sparse_pooled_end[attn_layer_idx],
+              attn_layer_idx, pos, 1, arena.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, arena.sparse_config, arena.stream,
+              attention_scratch.split_k);
+      if (!sparse_decode)
+        arena.NoteDenseKvWrite(attn_layer_idx, pos);
+      if (sparse_decode) {
+        // done
+      } else if (use_split_k_decode || arena.UsesQ8AttentionKv()) {
         LaunchAttention(
             attention_scratch.q.data(), attention_scratch.k.data(),
             attention_scratch.v.data(), ssm_scratch.gate.data(),
