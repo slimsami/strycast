@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "name": "strycast_qwen35moe",
-  "version": "0.1.0",
-  "api_version": ">= 0.2.21",
+  "version": "0.2.0",
+  "api_version": ">= 0.3.0",
   "entry": "strycast_qwen35moe_register",
   "registration_target": "strycast_q35",
   "depends": [],
