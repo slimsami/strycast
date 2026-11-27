@@ -261,8 +261,10 @@ Q8_0 layout: per position and KV head, 256 int8 values and 8 FP16 scales, one
 per block of 32, so 272 bytes instead of 512. The writers quantize as rows are
 stored, and the decode, verify and prefill attention kernels read the int8
 rows directly, dequantizing to FP16 as they stage keys and values; the
-attention arithmetic is otherwise the FP16 path's. The default stays `f16`,
-and other models refuse the option. Only this model's 10 attention layers
+attention arithmetic is otherwise the FP16 path's. The default stays `f16`.
+The Qwen3.8 27B takes the option too
+([notes](../qwen3.8-27b/README.md#8-bit-kv-cache)); other models refuse it.
+Only this model's 10 attention layers
 hold KV, so the saving is 2.34 GiB per session at context 262144 (0.59 GiB at
 65536). Prompt-cache entries record the format, so FP16 and Q8 entries are
 never mixed. MTP and DFlash2 keep their own FP16 draft caches, and greedy

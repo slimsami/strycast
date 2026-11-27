@@ -1519,13 +1519,15 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenTextRunner(
     return nullptr;
   }
   if (kv_storage == hip::QwenKvCacheStorage::kQ8) {
-    // The 8-bit kernels cover 256-wide heads, eight query heads per KV head
-    // and a 64-wide rotary span: Qwen3.6-35B-A3B.
+    // The 8-bit kernels cover 256-wide heads, a 64-wide rotary span and
+    // eight (Qwen3.6-35B-A3B) or six (Qwen3.8 27B) query heads per KV head.
     const auto& config = model->GetConfig();
     if (config.head_dim != 256 || config.rotary_dim != 64 ||
-        config.num_attention_heads != 8 * config.num_key_value_heads) {
+        (config.num_attention_heads != 8 * config.num_key_value_heads &&
+         config.num_attention_heads != 6 * config.num_key_value_heads)) {
       if (error)
-        *error = "--kv-cache q8_0 supports Qwen3.6-35B-A3B only";
+        *error =
+            "--kv-cache q8_0 supports Qwen3.6-35B-A3B and Qwen3.8 27B only";
       return nullptr;
     }
   }

@@ -73,7 +73,7 @@
       "providers": [
         "qwen27-q4"
       ],
-      "help": "Attention KV cache format: f16 (default) or q8_0, 8-bit with about half the KV memory (Qwen3.6-35B-A3B only)"
+      "help": "Attention KV cache format: f16 (default) or q8_0, 8-bit with about half the KV memory (Qwen3.6-35B-A3B and Qwen3.8 27B only)"
     }
   ],
   "targets": {

@@ -1,5 +1,6 @@
-// Oracle test for the 8-bit attention KV cache (--kv-cache q8_0) on the
-// Qwen3.6-35B-A3B head shape: sixteen query heads over two 256-wide KV heads.
+// Oracle test for the 8-bit attention KV cache (--kv-cache q8_0) on the two
+// head shapes that take it: Qwen3.6-35B-A3B (sixteen query heads over two
+// 256-wide KV heads) and Qwen3.8 27B (24 over four).
 //
 // Writers: the batched (prefill and verification) and single-token fused
 // writers and the unfused decode writer store the rows a CPU Q8_0
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <utility>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -36,13 +38,25 @@ namespace {
 
 namespace kv_q8 = gufo::hip::kv_q8;
 
-constexpr std::uint32_t kHeads = 16;
-constexpr std::uint32_t kKvHeads = 2;
 constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kRotaryDim = 64;
-constexpr std::size_t kKvWidth = std::size_t{kKvHeads} * kHeadDim;
-constexpr std::size_t kAttnWidth = std::size_t{kHeads} * kHeadDim;
-constexpr std::size_t kTokenBytes = std::size_t{kKvHeads} * kv_q8::kRowBytes;
+
+// The head shape under test, set by main() before each round.
+std::uint32_t g_heads = 16;
+std::uint32_t g_kv_heads = 2;
+std::size_t g_kv_width = std::size_t{g_kv_heads} * kHeadDim;
+std::size_t g_attn_width = std::size_t{g_heads} * kHeadDim;
+std::size_t g_token_bytes = std::size_t{g_kv_heads} * kv_q8::kRowBytes;
+
+void SetShape(std::uint32_t heads, std::uint32_t kv_heads) {
+  g_heads = heads;
+  g_kv_heads = kv_heads;
+  g_kv_width = std::size_t{g_kv_heads} * kHeadDim;
+  g_attn_width = std::size_t{g_heads} * kHeadDim;
+  g_token_bytes = std::size_t{g_kv_heads} * kv_q8::kRowBytes;
+  std::cout << "shape: " << heads << " query heads over " << kv_heads
+            << " KV heads\n";
+}
 
 class Rng {
 public:
@@ -140,10 +154,10 @@ void ExpectRow(const std::uint8_t* got, const float* x, const char* what) {
 
 void TestWriters() {
   constexpr std::uint32_t kLayer = 1, kContext = 64, kStart = 37, kBatch = 5;
-  const std::size_t cache_bytes = 2 * kContext * kTokenBytes;
+  const std::size_t cache_bytes = 2 * kContext * g_token_bytes;
   Rng rng(7);
-  std::vector<float> q(kBatch * kAttnWidth), k(kBatch * kKvWidth),
-      v(kBatch * kKvWidth), q_weight(kHeadDim), k_weight(kHeadDim);
+  std::vector<float> q(kBatch * g_attn_width), k(kBatch * g_kv_width),
+      v(kBatch * g_kv_width), q_weight(kHeadDim), k_weight(kHeadDim);
   for (auto& x : q)
     x = rng.Uniform(-2.0F, 2.0F);
   for (auto& x : k)
@@ -152,7 +166,7 @@ void TestWriters() {
     x = rng.Uniform(-3.0F, 3.0F);
   // A large outlier in one block, as RoPE dimensions of real keys have.
   k[3] = 40.0F;
-  v[kKvWidth + 300] = -25.0F;
+  v[g_kv_width + 300] = -25.0F;
   for (auto& x : q_weight)
     x = rng.Uniform(0.5F, 1.5F);
   for (auto& x : k_weight)
@@ -168,18 +182,18 @@ void TestWriters() {
   gufo::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
       d_q.data(), d_k.data(), d_v.data(), d_qw.data(), d_kw.data(),
       d_q_out.data(), d_k_out.data(), nullptr, nullptr, batched_k.data(),
-      batched_v.data(), kLayer, kStart, kBatch, kContext, kHeads, kKvHeads,
+      batched_v.data(), kLayer, kStart, kBatch, kContext, g_heads, g_kv_heads,
       kHeadDim, kRotaryDim, 1.0e7F, 1e-6F, nullptr, nullptr, true);
   const auto k_rot = Download(d_k_out, k.size());
   const auto got_k = Download(batched_k, cache_bytes);
   const auto got_v = Download(batched_v, cache_bytes);
 
   const auto row_at = [&](std::uint32_t pos, std::uint32_t head) {
-    return kv_q8::RowOffset(kLayer, pos, head, kContext, kKvHeads);
+    return kv_q8::RowOffset(kLayer, pos, head, kContext, g_kv_heads);
   };
   for (std::uint32_t b = 0; b < kBatch; ++b) {
-    for (std::uint32_t head = 0; head < kKvHeads; ++head) {
-      const std::size_t src = b * kKvWidth + head * kHeadDim;
+    for (std::uint32_t head = 0; head < g_kv_heads; ++head) {
+      const std::size_t src = b * g_kv_width + head * kHeadDim;
       ExpectRow(&got_k[row_at(kStart + b, head)], &k_rot[src],
                 "batched writer K row differs from the CPU quantization");
       ExpectRow(&got_v[row_at(kStart + b, head)], &v[src],
@@ -201,11 +215,11 @@ void TestWriters() {
     HIP_CHECK(
         hipMemcpy(d_pos.data(), &pos, sizeof(pos), hipMemcpyHostToDevice));
     gufo::hip::LaunchFusedQKNormRoPEKvWrite(
-        d_q.data() + b * kAttnWidth, d_k.data() + b * kKvWidth,
-        d_v.data() + b * kKvWidth, d_qw.data(), d_kw.data(), d_q_out.data(),
+        d_q.data() + b * g_attn_width, d_k.data() + b * g_kv_width,
+        d_v.data() + b * g_kv_width, d_qw.data(), d_kw.data(), d_q_out.data(),
         d_k_out.data(), nullptr, nullptr, single_k.data(), single_v.data(),
-        kLayer, d_pos.data(), kContext, kHeads, kKvHeads, kHeadDim, kRotaryDim,
-        1.0e7F, 1e-6F, nullptr, nullptr, true);
+        kLayer, d_pos.data(), kContext, g_heads, g_kv_heads, kHeadDim,
+        kRotaryDim, 1.0e7F, 1e-6F, nullptr, nullptr, true);
     HIP_CHECK(hipDeviceSynchronize());
   }
   if (Download(single_k, cache_bytes) != got_k ||
@@ -216,14 +230,14 @@ void TestWriters() {
   auto plain_k = Upload(fill), plain_v = Upload(fill);
   const auto d_k_rot = Upload(k_rot);
   const std::size_t row_scratch =
-      gufo::hip::detail::DecodeAttentionScratchElements(kHeads, kHeadDim);
-  gufo::test::DeviceBuffer<float> d_out(kAttnWidth), d_scratch(row_scratch);
+      gufo::hip::detail::DecodeAttentionScratchElements(g_heads, kHeadDim);
+  gufo::test::DeviceBuffer<float> d_out(g_attn_width), d_scratch(row_scratch);
   for (std::uint32_t b = 0; b < kBatch; ++b) {
     gufo::hip::LaunchAttention(
-        d_q_out.data(), d_k_rot.data() + b * kKvWidth,
-        d_v.data() + b * kKvWidth, nullptr, nullptr, nullptr, plain_k.data(),
-        plain_v.data(), d_out.data(), kLayer, kStart + b, kContext, kHeads,
-        kKvHeads, kHeadDim, nullptr, d_scratch.data(), false, true);
+        d_q_out.data(), d_k_rot.data() + b * g_kv_width,
+        d_v.data() + b * g_kv_width, nullptr, nullptr, nullptr, plain_k.data(),
+        plain_v.data(), d_out.data(), kLayer, kStart + b, kContext, g_heads,
+        g_kv_heads, kHeadDim, nullptr, d_scratch.data(), false, true);
   }
   // Rows before kStart hold random bytes, which may decode to infinities in
   // the attention output; only the cache bytes are checked here.
@@ -241,12 +255,13 @@ struct Cache {
 
 // Layer 1 of a two-layer cache; every row is quantized from random values.
 Cache MakeCache(std::uint32_t context, Rng& rng) {
-  Cache cache{std::vector<std::uint8_t>(2 * context * kTokenBytes),
-              std::vector<std::uint8_t>(2 * context * kTokenBytes), context};
+  Cache cache{std::vector<std::uint8_t>(2 * context * g_token_bytes),
+              std::vector<std::uint8_t>(2 * context * g_token_bytes), context};
   std::vector<float> x(kHeadDim);
   for (std::uint32_t pos = 0; pos < context; ++pos) {
-    for (std::uint32_t head = 0; head < kKvHeads; ++head) {
-      const std::size_t at = kv_q8::RowOffset(1, pos, head, context, kKvHeads);
+    for (std::uint32_t head = 0; head < g_kv_heads; ++head) {
+      const std::size_t at =
+          kv_q8::RowOffset(1, pos, head, context, g_kv_heads);
       for (auto& value : x)
         value = rng.Uniform(-1.0F, 1.0F);
       x[pos % kHeadDim] = 6.0F;
@@ -268,13 +283,13 @@ void Reference(const Cache& cache, const std::vector<float>& q,
   *max_error = 0.0;
   *magnitude = 0.0;
   const auto at = [&](std::uint32_t pos, std::uint32_t head) {
-    return kv_q8::RowOffset(1, pos, head, cache.context, kKvHeads);
+    return kv_q8::RowOffset(1, pos, head, cache.context, g_kv_heads);
   };
   for (std::uint32_t row = 0; row < rows; ++row) {
     const std::uint32_t pos = start_pos + row;
-    for (std::uint32_t head = 0; head < kHeads; ++head) {
-      const std::uint32_t kv_head = head / (kHeads / kKvHeads);
-      const float* qh = &q[row * kAttnWidth + head * kHeadDim];
+    for (std::uint32_t head = 0; head < g_heads; ++head) {
+      const std::uint32_t kv_head = head / (g_heads / g_kv_heads);
+      const float* qh = &q[row * g_attn_width + head * kHeadDim];
       std::vector<double> scores(pos + 1);
       double max_score = -INFINITY;
       for (std::uint32_t key = 0; key <= pos; ++key) {
@@ -292,7 +307,7 @@ void Reference(const Cache& cache, const std::vector<float>& q,
         double acc = 0.0;
         for (std::uint32_t key = 0; key <= pos; ++key)
           acc += scores[key] * Dequantized(&cache.v[at(key, kv_head)], d);
-        const std::size_t i = row * kAttnWidth + head * kHeadDim + d;
+        const std::size_t i = row * g_attn_width + head * kHeadDim + d;
         const double want = acc / sum / (1.0 + std::exp(-gate[i]));
         *max_error = std::max(*max_error, std::fabs(want - got[i]));
         *magnitude = std::max(*magnitude, std::fabs(want));
@@ -309,9 +324,9 @@ std::vector<float> RunDecode(const Cache& cache, const std::vector<float>& q,
   auto v = cache.v;
   // Positions past valid_end are not written yet in single-token decoding.
   for (std::uint32_t pos = valid_end; pos < cache.context; ++pos) {
-    for (std::uint32_t head = 0; head < kKvHeads; ++head) {
+    for (std::uint32_t head = 0; head < g_kv_heads; ++head) {
       const std::size_t at =
-          kv_q8::RowOffset(1, pos, head, cache.context, kKvHeads);
+          kv_q8::RowOffset(1, pos, head, cache.context, g_kv_heads);
       for (std::size_t i = 0; i < kv_q8::kHeadDim; ++i) {
         k[at + i] = rng.Byte();
         v[at + i] = rng.Byte();
@@ -319,22 +334,22 @@ std::vector<float> RunDecode(const Cache& cache, const std::vector<float>& q,
     }
   }
   const std::size_t row_scratch =
-      gufo::hip::detail::DecodeAttentionScratchElements(kHeads, kHeadDim);
+      gufo::hip::detail::DecodeAttentionScratchElements(g_heads, kHeadDim);
   auto d_k = Upload(k), d_v = Upload(v);
   const auto d_q = Upload(q), d_gate = Upload(gate);
-  gufo::test::DeviceBuffer<float> d_out(rows * kAttnWidth),
+  gufo::test::DeviceBuffer<float> d_out(rows * g_attn_width),
       d_scratch(rows * row_scratch);
   gufo::hip::LaunchCausalDecodeAttention(
       d_q.data(), d_gate.data(), nullptr, nullptr, d_k.data(), d_v.data(),
-      d_out.data(), 1, start_pos, rows, cache.context, kHeads, kKvHeads,
+      d_out.data(), 1, start_pos, rows, cache.context, g_heads, g_kv_heads,
       kHeadDim, nullptr, {d_scratch.data(), rows * row_scratch}, true);
-  return Download(d_out, rows * kAttnWidth);
+  return Download(d_out, rows * g_attn_width);
 }
 
 void TestDecode(std::uint32_t start_pos, std::uint32_t rows) {
   Rng rng(start_pos * 31U + rows);
   const auto cache = MakeCache(start_pos + rows + 32, rng);
-  std::vector<float> q(rows * kAttnWidth), gate(rows * kAttnWidth);
+  std::vector<float> q(rows * g_attn_width), gate(rows * g_attn_width);
   for (auto& x : q)
     x = rng.Uniform(-3.0F, 3.0F);
   for (auto& x : gate)
@@ -346,14 +361,14 @@ void TestDecode(std::uint32_t start_pos, std::uint32_t rows) {
   if (!(max_error <= 4e-3 * std::max(magnitude, 1e-3)))
     Fail("8-bit decode attention is far from the reference");
   for (std::uint32_t row = 0; row < rows; ++row) {
-    const std::vector<float> q_row(q.begin() + row * kAttnWidth,
-                                   q.begin() + (row + 1) * kAttnWidth);
-    const std::vector<float> gate_row(gate.begin() + row * kAttnWidth,
-                                      gate.begin() + (row + 1) * kAttnWidth);
+    const std::vector<float> q_row(q.begin() + row * g_attn_width,
+                                   q.begin() + (row + 1) * g_attn_width);
+    const std::vector<float> gate_row(gate.begin() + row * g_attn_width,
+                                      gate.begin() + (row + 1) * g_attn_width);
     const auto alone = RunDecode(cache, q_row, gate_row, start_pos + row, 1,
                                  start_pos + row + 1, rng);
-    if (std::memcmp(alone.data(), &batched[row * kAttnWidth],
-                    kAttnWidth * sizeof(float)) != 0)
+    if (std::memcmp(alone.data(), &batched[row * g_attn_width],
+                    g_attn_width * sizeof(float)) != 0)
       Fail("an 8-bit verification row differs from the same position alone");
   }
   std::cout << "8-bit decode attention start " << start_pos << " rows " << rows
@@ -367,14 +382,14 @@ void TestPrefill(std::uint32_t start_pos, std::uint32_t rows,
                  std::uint32_t packed_heads = 0) {
   Rng rng(start_pos * 17U + rows + 3U);
   const auto cache = MakeCache(start_pos + rows + 16, rng);
-  std::vector<float> q(rows * kAttnWidth), gate(rows * kAttnWidth);
+  std::vector<float> q(rows * g_attn_width), gate(rows * g_attn_width);
   for (auto& x : q)
     x = rng.Uniform(-3.0F, 3.0F);
   for (auto& x : gate)
     x = rng.Uniform(-2.0F, 2.0F);
   auto d_k = Upload(cache.k), d_v = Upload(cache.v);
   const auto d_q = Upload(q), d_gate = Upload(gate);
-  gufo::test::DeviceBuffer<float> d_out(rows * kAttnWidth);
+  gufo::test::DeviceBuffer<float> d_out(rows * g_attn_width);
   // One head's padded FP16 keys or values, in floats.
   const std::size_t head_floats =
       ((start_pos + rows + 15U) & ~15U) * kHeadDim / 2;
@@ -388,10 +403,10 @@ void TestPrefill(std::uint32_t start_pos, std::uint32_t rows,
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q.data(), nullptr, nullptr, d_gate.data(), nullptr, nullptr,
           d_k.data(), d_v.data(), d_out.data(), 1, start_pos, rows,
-          cache.context, kHeads, kKvHeads, kHeadDim, nullptr, nullptr, 0,
+          cache.context, g_heads, g_kv_heads, kHeadDim, nullptr, nullptr, 0,
           /*skip_kv_write=*/true, packed_k, packed_v, 0, /*kv_q8=*/true))
-    Fail("8-bit prefill attention rejected the 35B shape");
-  const auto got = Download(d_out, rows * kAttnWidth);
+    Fail("8-bit prefill attention rejected the head shape");
+  const auto got = Download(d_out, rows * g_attn_width);
   double max_error = 0.0, magnitude = 0.0;
   Reference(cache, q, gate, start_pos, rows, got, &max_error, &magnitude);
   if (!(max_error <= 4e-3 * std::max(magnitude, 1e-3)))
@@ -412,21 +427,30 @@ int main() {
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
-  TestWriters();
-  // Below the FP16 split-K threshold, one partition, many partitions, and
-  // rows on both sides of the 256-to-512 partition step.
-  TestDecode(5, 3);
-  TestDecode(140, 1);
-  TestDecode(150, 4);
-  TestDecode(5000, 8);
-  TestDecode(8190, 4);
-  TestPrefill(0, 33);
-  TestPrefill(300, 70);
-  TestPrefill(2000, 64);
-  // Packed into FP16 scratch: all heads at once, then one head at a time.
-  TestPrefill(0, 1024, kKvHeads);
-  TestPrefill(1000, 1024, 1);
-  std::cout << "Qwen 8-bit KV cache ops test passed on gfx1151.\n";
+  // Qwen3.6-35B-A3B (four positions per decode block), then Qwen3.8 27B (five
+  // positions per block over six heads, two padding rows).
+  for (const auto [heads, kv_heads] :
+       {std::pair{16U, 2U}, std::pair{24U, 4U}}) {
+    SetShape(heads, kv_heads);
+    TestWriters();
+    // Below the FP16 split-K threshold, one partition, many partitions, and
+    // rows on both sides of the 256-to-512 partition step.
+    TestDecode(5, 3);
+    TestDecode(140, 1);
+    TestDecode(150, 4);
+    TestDecode(5000, 8);
+    TestDecode(8190, 4);
+    // One full block of positions and one past it, for either shape.
+    TestDecode(700, 5);
+    TestDecode(3000, 11);
+    TestPrefill(0, 33);
+    TestPrefill(300, 70);
+    TestPrefill(2000, 64);
+    // Packed into FP16 scratch: all heads at once, then one head at a time.
+    TestPrefill(0, 1024, g_kv_heads);
+    TestPrefill(1000, 1024, 1);
+  }
+  std::cout << "Qwen 8-bit KV cache ops test passed.\n";
 #endif
   return 0;
 }
