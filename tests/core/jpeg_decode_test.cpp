@@ -55,6 +55,14 @@ constexpr int kMaxDifference = 6;
 constexpr int kMaxSubsampledBorderDifference = 40;
 constexpr double kMaxMeanDifference = 1.0;
 
+// libjpeg-turbo writes lossless JPEG (jpeg_enable_lossless) from 3.0 on.
+#if defined(LIBJPEG_TURBO_VERSION_NUMBER) && \
+    LIBJPEG_TURBO_VERSION_NUMBER >= 3000000
+constexpr bool kLosslessEncoder = true;
+#else
+constexpr bool kLosslessEncoder = false;
+#endif
+
 constexpr std::string_view kArithmetic =
     "zune-jpeg does not decode arithmetic coding (SOF9, SOF10); libjpeg-turbo "
     "does";
@@ -323,8 +331,11 @@ void Encode(Writer& writer, const Format& format, unsigned width,
   jpeg_set_defaults(&encoder);
   jpeg_set_colorspace(&encoder, format.stored);
   jpeg_set_quality(&encoder, format.quality, TRUE);
+#if defined(LIBJPEG_TURBO_VERSION_NUMBER) && \
+    LIBJPEG_TURBO_VERSION_NUMBER >= 3000000
   if (format.lossless)
     jpeg_enable_lossless(&encoder, 1, 0);
+#endif
   if (!format.lossless && encoder.num_components > 1) {
     encoder.comp_info[0].h_samp_factor = format.h;
     encoder.comp_info[0].v_samp_factor = format.v;
@@ -365,6 +376,9 @@ Bytes WriteJpeg(const Format& format, unsigned width, unsigned height,
     std::longjmp(reinterpret_cast<Writer*>(common->err)->jump, 1);
   };
   writer->manager.output_message = [](j_common_ptr) {};
+  // Without a lossless encoder the case is reported as unsupported.
+  if (format.lossless && !kLosslessEncoder)
+    return {};
   if (setjmp(writer->jump) != 0)
     return {};
   Encode(*writer, format, width, height, segments);
@@ -480,11 +494,12 @@ void AddUnsupportedCases(Cases& cases) {
     cases.Valid(format.name, std::move(jpeg));
   }
   // libjpeg-turbo cannot convert lossless gray to RGB, so both reject it.
-  cases.Mutated("lossless-gray", WriteJpeg({.name = "lossless-gray",
-                                            .input = JCS_GRAYSCALE,
-                                            .stored = JCS_GRAYSCALE,
-                                            .lossless = true},
-                                           33, 31));
+  if (kLosslessEncoder)
+    cases.Mutated("lossless-gray", WriteJpeg({.name = "lossless-gray",
+                                              .input = JCS_GRAYSCALE,
+                                              .stored = JCS_GRAYSCALE,
+                                              .lossless = true},
+                                             33, 31));
 }
 
 void AddFormatCases(Cases& cases) {
@@ -860,7 +875,8 @@ int RunCases() {
     CheckCase(test, failures, worst);
   }
   for (const auto& [name, reason] : kKnownDeviations) {
-    if (!names.contains(name))
+    if (!names.contains(name) &&
+        std::ranges::find(cases.unsupported, name) == cases.unsupported.end())
       failures.Add("kKnownDeviations names unknown case " + std::string(name));
   }
   for (const auto& name : cases.unsupported)
