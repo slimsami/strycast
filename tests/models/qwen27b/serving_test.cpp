@@ -1160,11 +1160,13 @@ int main(int argc, const char* const* argv) {
         Expect(restored_continuation.cache_hit &&
                    restored_continuation.cache_disk_hit,
                "fresh Qwen backend did not restore its disk prefix");
-        Expect(restored_continuation.cached_prompt_tokens ==
+        // The writer also publishes its reply's generated frontier, so the
+        // restore may reuse more than the stable message prefix.
+        Expect(restored_continuation.cached_prompt_tokens >=
                        stable_chat_prompt.size() &&
                    restored_continuation.cached_prompt_tokens <
                        restored_continuation.prompt_tokens,
-               "Qwen disk restore did not report its exact reusable prefix");
+               "Qwen disk restore did not report a reusable prefix");
         Expect(restored_continuation.cache_restore_bytes > 0,
                "Qwen disk restore did not report restored bytes");
         Expect(restored_continuation.tokens == direct_continuation,
@@ -1239,13 +1241,14 @@ int main(int argc, const char* const* argv) {
           Expect(restored_dflash_continuation.cache_hit &&
                      restored_dflash_continuation.cache_disk_hit,
                  "fresh DFlash backend did not restore its disk prefix");
-          Expect(restored_dflash_continuation.cached_prompt_tokens ==
+          // As above, the restore may reach the writer's generated frontier.
+          Expect(restored_dflash_continuation.cached_prompt_tokens >=
                          stable_chat_prompt.size() &&
                      warm_dflash_continuation.cached_prompt_tokens >=
                          restored_dflash_continuation.cached_prompt_tokens &&
                      restored_dflash_continuation.cached_prompt_tokens <
                          restored_dflash_continuation.prompt_tokens,
-                 "DFlash disk restore did not report its exact prefix");
+                 "DFlash disk restore did not report a reusable prefix");
           Expect(restored_dflash_continuation.tokens ==
                      warm_dflash_continuation.tokens,
                  "DFlash disk restore changed continuation tokens");
