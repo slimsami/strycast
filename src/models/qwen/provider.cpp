@@ -40,7 +40,13 @@ void qwen_provider_register(gufo::ext::Registry& registry) {
                                 .max_draft_tokens = 7,
                                 .min_draft_tokens = 1,
                                 .draft_policy = "adaptive",
-                                .draft_policies = {"fixed", "adaptive"}}},
+                                .draft_policies = {"fixed", "adaptive"}},
+                               // Since --draft-tokens is ignored (#1124), the
+                               // MTP head's width is set here: up to 7 drafts
+                               // cost the 35B 4-12% on prose against 2.
+                               {.backend = "mtp",
+                                .max_draft_tokens = 3,
+                                .min_draft_tokens = 1}},
   });
 #endif
 }
