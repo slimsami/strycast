@@ -100,6 +100,21 @@ gpu_tests() {
   # Gufo's Rust components need the toolchain rust-toolchain.toml pins; the
   # distribution's cargo is too old. rustup's proxies select the pinned one.
   local rust=()
+  # Gufo's NPU runtime needs XRT's headers and coreutil library at configure
+  # time; the pinned toolchain's Nix store carries them.
+  if [ -z "${XILINX_XRT:-}" ]; then
+    for d in /nix/store/*-xrt-amdxdna-*/opt/xilinx/xrt; do
+      [ -f "$d/include/xrt/xrt_bo.h" ] && export XILINX_XRT=$d
+    done
+  fi
+  # XRT's headers include <uuid/uuid.h> and Gufo links libuuid; the host
+  # installs neither the header nor the development library.
+  for d in /nix/store/*-util-linux-minimal-*-dev; do
+    [ -f "$d/include/uuid/uuid.h" ] && incs="$incs -isystem $d/include"
+  done
+  for d in /nix/store/*-util-linux-minimal-*-lib; do
+    [ -f "$d/lib/libuuid.so" ] && flags="$flags -L$d/lib -Wl,-rpath,$d/lib"
+  done
   [ -x "$HOME/.cargo/bin/cargo" ] &&
     rust=(-DCARGO_EXECUTABLE="$HOME/.cargo/bin/cargo" -DRUSTC_EXECUTABLE="$HOME/.cargo/bin/rustc")
   if [ $venv_rc != 0 ]; then
@@ -109,7 +124,7 @@ gpu_tests() {
   if ! BUILD_TESTING=ON GUFO_BUILD_TOOLS=ON bash "$TOOLCHAIN/configure-rocm10.sh" "$src" nightly-gpu \
        > "$out/logs/configure.log" 2>&1 ||
      ! cmake -S "$src" -B "$tree" -DCMAKE_EXE_LINKER_FLAGS="$flags" -DCMAKE_SHARED_LINKER_FLAGS="$flags" \
-         -DPython3_EXECUTABLE="$venv/bin/python" -DCMAKE_CXX_FLAGS="$incs" "${rust[@]}" \
+         -DCMAKE_MODULE_LINKER_FLAGS="$flags" -DPython3_EXECUTABLE="$venv/bin/python" -DCMAKE_CXX_FLAGS="$incs" "${rust[@]}" \
        >> "$out/logs/configure.log" 2>&1 ||
      ! cmake --build "$tree" -j"$(nproc)" --target all qwen38_flash_next_model_tests \
          > "$out/logs/build.log" 2>&1; then
