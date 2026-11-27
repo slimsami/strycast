@@ -1,15 +1,17 @@
 // Decode and speculative-verification attention on the WMMA matrix cores for
 // eight query heads per KV head (Qwen3.6-35B-A3B: 16 query heads over two KV
-// heads, head_dim 256).
+// heads, head_dim 256), and with the 8-bit cache also for six (Qwen3.8 27B: 24
+// query heads over four KV heads).
 //
 // The scalar split-K kernel spends its time on per-position dot products and
 // lane reductions, not on reading the cache. Here a block takes one KV head
 // and one key partition and treats its eight query heads at up to eight
-// positions as a 64-row query tile, the same tile the prefill kernel
-// (attention_wmma.hip) uses: eight waves split four 16-row blocks by two
-// halves of the head dimension, K is staged per 16-key tile and V transposed
-// in LDS, with the next tile prefetched into registers. Row j is query head
-// (8 * kv_head + j % 8) at position start_pos + j / 8.
+// positions as a query tile of 16-row blocks: eight waves split the row
+// blocks by parts of the head dimension, K is staged per 16-key tile and V
+// transposed in LDS, with the next tile prefetched into registers. Row j is
+// query head (G * kv_head + j % G) at position start_pos + j / G, for G query
+// heads per KV head. Six heads fill 30 of the 32 rows with five positions; the
+// last two rows are padding that no position owns.
 //
 // A row's result depends on that row alone: its query, its causal limit and
 // the absolute key tiling. Partitions are fixed runs of keys chosen from the
@@ -40,12 +42,11 @@ namespace gufo::hip {
 namespace {
 
 constexpr std::uint32_t kHeadDim = 256;
-constexpr std::uint32_t kGroup = 8;
 #ifndef GUFO_WMMA_DECODE_POSITIONS
 #define GUFO_WMMA_DECODE_POSITIONS 4
 #endif
-constexpr std::uint32_t kPositions = GUFO_WMMA_DECODE_POSITIONS;
-constexpr std::uint32_t kRows = kGroup * kPositions;
+// Rows of one block: eight heads at GUFO_WMMA_DECODE_POSITIONS positions.
+constexpr std::uint32_t kRows = 8 * GUFO_WMMA_DECODE_POSITIONS;
 constexpr std::uint32_t kRowBlocks = kRows / 16;
 // Eight waves: every row block's score tile is split over the head dimension.
 constexpr std::uint32_t kDimSplits = 8 / kRowBlocks;
@@ -60,6 +61,11 @@ constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
 constexpr std::uint32_t kMinPartition = 256;
 static_assert(kRowBlocks * kDimSplits == 8 && kKRegs == 2 && kVRegs == 2 &&
               kKeys % kSoftmaxLanes == 0);
+
+// Positions one block decodes for kGroup query heads per KV head.
+template<std::uint32_t kGroup>
+constexpr std::uint32_t kPositions = kRows / kGroup;
+static_assert(kPositions<8> == GUFO_WMMA_DECODE_POSITIONS);
 
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
@@ -98,7 +104,7 @@ std::uint32_t DecodePartition(std::size_t length) {
 // unnormalized output in the split-K scratch layout that
 // QwenDecodeSplitKAttentionReduceKernel merges. k_layer and v_layer are one
 // layer of the FP16 cache, or of the 8-bit cache when kQ8.
-template<bool kQ8>
+template<std::uint32_t kGroup, bool kQ8>
 __launch_bounds__(256, 2) __global__ void WmmaDecodeAttentionPartials(
     const float* __restrict__ q, const void* __restrict__ k_layer,
     const void* __restrict__ v_layer, float* __restrict__ scratch,
@@ -119,6 +125,9 @@ __launch_bounds__(256, 2) __global__ void WmmaDecodeAttentionPartials(
   const std::uint32_t visible_end = start_pos + positions;
   const std::uint32_t key_begin = split * partition;
   const std::uint32_t key_end = min(key_begin + partition, visible_end);
+  static_assert(kGroup >= 1 && kGroup <= kRows);
+  // Padding rows past kGroup * kPositions get position kPositions, which no
+  // launch reaches: they are never live.
   const auto row_position = [](std::uint32_t row) { return row / kGroup; };
   const auto row_head = [&](std::uint32_t row) {
     return kv_head * kGroup + (row % kGroup);
@@ -352,13 +361,13 @@ __launch_bounds__(256, 2) __global__ void WmmaDecodeAttentionPartials(
       for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
         const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][0]);
         v8f next = Wmma(p_frag, v_frag, o_acc[rb][t]);
-        // Row block rb holds positions 2 rb and 2 rb + 1. A row whose own
+        // Row block rb starts at position 16 rb / kGroup. A row whose own
         // position falls inside this tile sums only its visible keys, in
         // order, so it does not depend on what later keys hold (a single
         // decoded row has not written them yet). A row whose position
         // precedes the tile keeps its accumulator: its probabilities are all
         // zero there, and a single decoded row never visits the tile.
-        if (key_start + kKeys - 1 > start_pos + 2 * rb) {
+        if (key_start + kKeys - 1 > start_pos + (rb * 16) / kGroup) {
           v8f tail = o_acc[rb][t];
 #pragma unroll
           for (std::uint32_t key = 0; key < kKeys; ++key) {
@@ -434,6 +443,39 @@ __launch_bounds__(256, 2) __global__ void WmmaDecodeAttentionPartials(
   }
 }
 
+namespace {
+
+template<std::uint32_t kGroup>
+void LaunchWmmaDecodePartials(const float* q, const std::uint8_t* k,
+                              const std::uint8_t* v, float* scratch,
+                              std::uint32_t start_pos, std::size_t positions,
+                              std::uint32_t partition, std::uint32_t splits,
+                              std::uint32_t num_heads,
+                              std::uint32_t num_kv_heads,
+                              std::size_t row_scratch, hipStream_t stream,
+                              bool kv_q8) {
+  const std::size_t attn_width = static_cast<std::size_t>(num_heads) * kHeadDim;
+  for (std::size_t first = 0; first < positions; first += kPositions<kGroup>) {
+    const auto count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(kPositions<kGroup>, positions - first));
+    const dim3 grid(splits, num_kv_heads);
+    if (kv_q8) {
+      WmmaDecodeAttentionPartials<kGroup, true><<<grid, 256, 0, stream>>>(
+          q + first * attn_width, k, v, scratch + first * row_scratch,
+          start_pos + static_cast<std::uint32_t>(first), count, partition,
+          num_heads, num_kv_heads);
+    } else if constexpr (kGroup == 8) {
+      // Only eight heads have an FP16 instantiation (see the launcher).
+      WmmaDecodeAttentionPartials<kGroup, false><<<grid, 256, 0, stream>>>(
+          q + first * attn_width, k, v, scratch + first * row_scratch,
+          start_pos + static_cast<std::uint32_t>(first), count, partition,
+          num_heads, num_kv_heads);
+    }
+  }
+}
+
+}  // namespace
+
 bool LaunchQwenWmmaDecodeAttention(
     const float* q, const float* gate, const void* k_cache_f16,
     const void* v_cache_f16, float* out_context, std::uint32_t layer_idx,
@@ -442,7 +484,11 @@ bool LaunchQwenWmmaDecodeAttention(
     hipStream_t stream, std::span<float> scratch, bool kv_q8) {
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
-  if (num_heads != kGroup * num_kv_heads || head_dim != kHeadDim ||
+  // Eight heads per KV head in both formats; six only with the 8-bit cache,
+  // so the FP16 27B keeps its scalar split-K route and its bits.
+  const bool group8 = num_heads == 8 * num_kv_heads;
+  const bool group6 = kv_q8 && num_heads == 6 * num_kv_heads;
+  if (num_kv_heads == 0 || !(group8 || group6) || head_dim != kHeadDim ||
       k_cache_f16 == nullptr || v_cache_f16 == nullptr || positions == 0 ||
       scratch.size() / positions < row_scratch)
     return false;
@@ -476,22 +522,14 @@ bool LaunchQwenWmmaDecodeAttention(
                   static_cast<std::size_t>(layer_idx) * layer_bytes;
   const auto* v = static_cast<const std::uint8_t*>(v_cache_f16) +
                   static_cast<std::size_t>(layer_idx) * layer_bytes;
-  const std::size_t attn_width = static_cast<std::size_t>(num_heads) * kHeadDim;
-  for (std::size_t first = 0; first < positions; first += kPositions) {
-    const auto count = static_cast<std::uint32_t>(
-        std::min<std::size_t>(kPositions, positions - first));
-    const dim3 grid(splits, num_kv_heads);
-    if (kv_q8) {
-      WmmaDecodeAttentionPartials<true><<<grid, 256, 0, stream>>>(
-          q + first * attn_width, k, v, scratch.data() + first * row_scratch,
-          start_pos + static_cast<std::uint32_t>(first), count, partition,
-          num_heads, num_kv_heads);
-    } else {
-      WmmaDecodeAttentionPartials<false><<<grid, 256, 0, stream>>>(
-          q + first * attn_width, k, v, scratch.data() + first * row_scratch,
-          start_pos + static_cast<std::uint32_t>(first), count, partition,
-          num_heads, num_kv_heads);
-    }
+  if (group8) {
+    LaunchWmmaDecodePartials<8>(q, k, v, scratch.data(), start_pos, positions,
+                                partition, splits, num_heads, num_kv_heads,
+                                row_scratch, stream, kv_q8);
+  } else {
+    LaunchWmmaDecodePartials<6>(q, k, v, scratch.data(), start_pos, positions,
+                                partition, splits, num_heads, num_kv_heads,
+                                row_scratch, stream, kv_q8);
   }
   LaunchSplitKAttentionReduce(gate, scratch.data(), out_context, num_heads,
                               static_cast<std::uint32_t>(positions), splits,

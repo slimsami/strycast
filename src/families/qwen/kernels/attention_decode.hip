@@ -902,7 +902,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
              detail::DecodeAttentionScratchElements(num_heads, head_dim)},
             true))
       throw std::invalid_argument(
-          "8-bit KV attention supports eight query heads per KV head");
+          "8-bit KV attention supports eight or six query heads per KV head");
     return;
   }
   // 1. Write K and V into every non-null selected KV representation across all
