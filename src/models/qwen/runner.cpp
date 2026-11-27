@@ -1815,7 +1815,6 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenTextRunner(
   // Each session's wide copies need a larger SSM replay ring (ResourceClaim).
   // Narrow the width until the configured sessions fit, rather than refusing
   // a session count the ordinary verifier width fits.
-  const std::size_t sessions = std::max<std::size_t>(options.session_count, 1);
   const auto fit = [&](std::uint32_t rows) {
     runner->LimitCopyRows(rows);
     const auto claim = runner->ResourceClaim();
