@@ -1,4 +1,4 @@
-From e3c75b17359e6005c61f0fd462f3ae97668b842e Mon Sep 17 00:00:00 2001
+From 8c069f8abd9fc4267b590a52de5403f2a71fe3ab Mon Sep 17 00:00:00 2001
 From: Sami Slimani <slimsamister@gmail.com>
 Date: Thu, 5 Nov 2026 22:06:31 +0100
 Subject: [PATCH 2/3] port: drop the DFlash2 context skip and the prefill step
@@ -15,12 +15,12 @@ for a later return.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  q35/model/hip/dflash.hpp         |  5 ----
- q35/model/hip/dflash/backend.cpp | 27 ----------------------
- q35/model/runner.cpp             | 39 +++++---------------------------
- 3 files changed, 6 insertions(+), 65 deletions(-)
+ q35/model/hip/dflash/backend.cpp | 27 -----------------
+ q35/model/runner.cpp             | 50 ++++++--------------------------
+ 3 files changed, 9 insertions(+), 73 deletions(-)
 
 diff --git a/q35/model/hip/dflash.hpp b/q35/model/hip/dflash.hpp
-index 3587d26..a1644a7 100644
+index 446639a..2042198 100644
 --- a/q35/model/hip/dflash.hpp
 +++ b/q35/model/hip/dflash.hpp
 @@ -380,11 +380,6 @@ public:
@@ -36,7 +36,7 @@ index 3587d26..a1644a7 100644
  
    [[nodiscard]] speculative::DraftProposal Propose(
 diff --git a/q35/model/hip/dflash/backend.cpp b/q35/model/hip/dflash/backend.cpp
-index 3da4749..ad8661e 100644
+index 377c2cc..4b61879 100644
 --- a/q35/model/hip/dflash/backend.cpp
 +++ b/q35/model/hip/dflash/backend.cpp
 @@ -255,33 +255,6 @@ QwenDFlashGpuDraftBackend::CreateFromGguf(
@@ -74,10 +74,10 @@ index 3da4749..ad8661e 100644
      const speculative::DraftTargetContext& context) {
    CheckContinuation();
 diff --git a/q35/model/runner.cpp b/q35/model/runner.cpp
-index afcb7f3..7cadcab 100644
+index ea8e73e..a59dff5 100644
 --- a/q35/model/runner.cpp
 +++ b/q35/model/runner.cpp
-@@ -336,17 +336,6 @@ public:
+@@ -343,17 +343,6 @@ public:
      return verifier_ != nullptr;
    }
  
@@ -95,7 +95,7 @@ index afcb7f3..7cadcab 100644
    /// Token count of the whole prompt of the current request (0: unknown).
    void set_prompt_tokens(std::size_t tokens) noexcept {
      prompt_tokens_ = tokens;
-@@ -355,19 +344,12 @@ public:
+@@ -362,19 +351,12 @@ public:
      return prompt_tokens_;
    }
  
@@ -117,7 +117,7 @@ index afcb7f3..7cadcab 100644
      frontier_logits_.clear();
      if (decode_ready) {
        const auto logits = verifier_->CopyLastTargetLogits();
-@@ -427,7 +409,7 @@ public:
+@@ -448,7 +430,7 @@ public:
    }
  
    void ExtendSpeculative(std::span<const TextRunnerToken> suffix,
@@ -126,7 +126,7 @@ index afcb7f3..7cadcab 100644
      if (verifier_ == nullptr || !frontier_.has_value()) {
        throw std::logic_error("Qwen speculative prefix is not initialized");
      }
-@@ -437,7 +419,7 @@ public:
+@@ -458,7 +440,7 @@ public:
      }
      frontier_ =
          verifier_->ExtendPrompt(suffix, static_cast<std::uint32_t>(position_),
@@ -135,7 +135,7 @@ index afcb7f3..7cadcab 100644
      sequence_.insert(sequence_.end(), suffix.begin(), suffix.end());
      position_ += suffix.size();
      frontier_logits_.clear();
-@@ -673,7 +655,6 @@ private:
+@@ -694,7 +676,6 @@ private:
    hip::QwenMtpGpuDraftBackend* mtp_backend_{nullptr};
    models::qwen::ContinuationAdapter* adapter_{};
    cache::Slot* slot_{};
@@ -143,7 +143,7 @@ index afcb7f3..7cadcab 100644
    std::size_t prompt_tokens_{0};
    std::vector<TextRunnerToken> sequence_;
    std::size_t position_{0};
-@@ -1122,11 +1103,6 @@ public:
+@@ -1153,11 +1134,6 @@ public:
      qwen.PreparePrefixReuse(prefix);
    }
  
@@ -155,7 +155,7 @@ index afcb7f3..7cadcab 100644
    [[nodiscard]] TextPrefillStep Prefill(
        TextRunnerState& state, std::span<const TextRunnerToken> prompt,
        std::size_t offset, std::size_t max_input_tokens) const override {
-@@ -1151,8 +1127,6 @@ public:
+@@ -1182,8 +1158,6 @@ public:
            std::min<std::size_t>(max_input_tokens,
                                  qwen.executor().GetMaxPromptBatch()),
            prompt.size() - offset);
@@ -164,25 +164,60 @@ index afcb7f3..7cadcab 100644
        if (max_input_tokens != 0 && offset != 0 &&
            qwen.ResumeGeneratedToken(prompt[offset],
                                      offset + 1 == prompt.size())) {
-@@ -1167,7 +1141,7 @@ public:
-                 "Qwen prefill requires a nonzero token budget");
-           }
-           qwen.PrimeSpeculative(prompt.first(consumed),
--                                consumed == prompt.size(), keep_context_from);
-+                                consumed == prompt.size());
-           return {.consumed_tokens = consumed,
-                   .decode_ready = consumed == prompt.size()};
-         }
-@@ -1178,8 +1152,7 @@ public:
-               "Qwen DFlash retained prefix has no suffix to prefill");
-         }
-         qwen.ExtendSpeculative(prompt.subspan(offset, consumed),
--                               offset + consumed == prompt.size(),
+@@ -1193,8 +1167,7 @@ public:
+       const std::size_t consumed =
+           std::min(max_input_tokens, prompt.size() - offset);
+       const bool decode_ready = offset + consumed == prompt.size();
+-      PrefillPass(qwen, prompt, offset, consumed, decode_ready,
+-                  keep_context_from);
++      PrefillPass(qwen, prompt, offset, consumed, decode_ready);
+       return {
+           .consumed_tokens = consumed,
+           .decode_ready = decode_ready,
+@@ -1265,8 +1238,6 @@ public:
+       ~ClearYield() { executor.SetPrefillYield(1, {}); }
+     } clear_yield{qwen.executor()};
+     double capture_ms = 0;
+-    const std::uint32_t keep_context_from =
+-        qwen.KeepDraftContextFrom(qwen.TakeDraftContextHorizon());
+     std::size_t position = offset;
+     for (std::size_t pass = 0; pass < ends.size(); ++pass) {
+       const bool last = pass + 1 == ends.size();
+@@ -1285,7 +1256,7 @@ public:
+           // A boundary is a complete frontier, logits included, like the
+           // prompt snapshot target a pass ends at without in-pass checkpoints.
+           PrefillPass(qwen, prompt, position, ends[pass] - position,
+-                      !last || ends[pass] == prompt.size(), keep_context_from);
++                      !last || ends[pass] == prompt.size());
+         } catch (const hip::QwenPrefillCancelled&) {
+           activity.Rollback();
+           if (position == offset)
+@@ -1455,11 +1426,9 @@ public:
+ private:
+   // One prompt pass over `count` tokens from `offset`. `logits` completes the
+   // next-token frontier at its end, as a pass ending the model prompt does.
+-  // The draft drops prompt features before `keep_context_from`.
+   static void PrefillPass(QwenTextRunnerState& qwen,
+                           std::span<const TextRunnerToken> prompt,
+-                          std::size_t offset, std::size_t count, bool logits,
+-                          std::uint32_t keep_context_from) {
++                          std::size_t offset, std::size_t count, bool logits) {
+     if (qwen.speculative()) {
+       if (count == 0) {
+         throw std::logic_error(
+@@ -1468,10 +1437,9 @@ private:
+                           "prefill");
+       }
+       if (offset == 0)
+-        qwen.PrimeSpeculative(prompt.first(count), logits, keep_context_from);
++        qwen.PrimeSpeculative(prompt.first(count), logits);
+       else
+-        qwen.ExtendSpeculative(prompt.subspan(offset, count), logits,
 -                               keep_context_from);
-+                               offset + consumed == prompt.size());
-         return {
-             .consumed_tokens = consumed,
-             .decode_ready = offset + consumed == prompt.size(),
++        qwen.ExtendSpeculative(prompt.subspan(offset, count), logits);
+       return;
+     }
+     const auto frontier = qwen.executor().ForwardPromptBatch(
 -- 
 2.43.0
 
