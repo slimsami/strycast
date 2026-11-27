@@ -1024,10 +1024,10 @@ cache::Completion ContinuationAdapter::TransferRows(
         auto* device = native + (head * std::size_t{mtp.max_context_} + first) *
                                     head_bytes;
         auto* host = bytes + head * head_bytes;
-        Check(hipMemcpy2DAsync(load ? device : host, load ? head_bytes : row,
-                               load ? host : device, load ? row : head_bytes,
-                               head_bytes, end - first, direction,
-                               transfer.Native()));
+        // Capture and restore buffers are paged: stay within each page.
+        hip::CopyKvRows(load ? device : host, load ? head_bytes : row,
+                        load ? host : device, load ? row : head_bytes,
+                        head_bytes, end - first, direction, transfer.Native());
       }
     });
   }
